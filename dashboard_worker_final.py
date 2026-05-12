@@ -51,6 +51,11 @@ DASH_REDIS_DB   = int(os.getenv("REDIS_DB",    "0"))
 
 DASH_REDIS_KEY  = "dashboard:positions:latest"
 
+# stocks.csv — same file used by stock_realtime_feeder
+# contains symbol, lot_size, strike_step
+STOCKS_CSV = os.getenv("STOCKS_CSV",
+    "/home/report/devstudio/Prashant/Stock/stocks.csv")
+
 LOOP_SECONDS   = float(os.getenv("DASH_LOOP_SECONDS", "5.0"))
 EXPENSE_PER_CR = float(os.getenv("EXPENSE_PER_CR",    "10000"))
 
@@ -414,25 +419,38 @@ def get_ltp_redis() -> redis.Redis:
     )
 
 
-def load_lot_sizes_from_redis(r_ltp: redis.Redis, names: set) -> dict[str, int]:
+def load_lot_sizes_from_csv() -> dict[str, int]:
     """
-    Read lot sizes from Redis DB2:
-      fo:stock_spot:<SYM> → lot_size field
-    Falls back to LOT_SIZE_FALLBACK if not found in Redis.
+    Read lot sizes from stocks.csv (same file used by feeder).
+    Format: symbol,lot_size,strike_step
+    Falls back to LOT_SIZE_FALLBACK if file not found.
     """
     result = {}
-    for sym in names:
-        try:
-            val = r_ltp.hget(f"fo:stock_spot:{sym}", "lot_size")
-            if val:
-                result[sym] = int(float(val))
-                continue
-        except Exception:
-            pass
-        # Fallback
-        result[sym] = LOT_SIZE_FALLBACK.get(sym, 1)
+    if not os.path.exists(STOCKS_CSV):
+        log.warning("stocks.csv not found: %s — using fallback", STOCKS_CSV)
+        return dict(LOT_SIZE_FALLBACK)
 
-    log.info("Lot sizes loaded from Redis: %d symbols", len(result))
+    try:
+        with open(STOCKS_CSV, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or line.startswith("symbol"):
+                    continue
+                parts = line.split(",")
+                if len(parts) < 2:
+                    continue
+                sym      = parts[0].strip().upper()
+                lot_size = int(float(parts[1].strip()))
+                result[sym] = lot_size
+        log.info("Lot sizes loaded from CSV: %d symbols", len(result))
+    except Exception as e:
+        log.error("Error reading stocks.csv: %s", e)
+
+    # merge fallback for any missing
+    for sym, lot in LOT_SIZE_FALLBACK.items():
+        if sym not in result:
+            result[sym] = lot
+
     return result
 
 
@@ -629,9 +647,8 @@ def main():
                 time.sleep(LOOP_SECONDS)
                 continue
 
-            # 2. Get lot sizes from Redis DB2
-            all_names = set(token_map[t]["name"] for t in token_map)
-            lot_size_map = load_lot_sizes_from_redis(r_ltp, all_names)
+            # 2. Get lot sizes from stocks.csv
+            lot_size_map = load_lot_sizes_from_csv()
 
             # 3. Build per-token positions
             positions = build_positions_from_fills(fills, token_map, lot_size_map)
