@@ -30,6 +30,7 @@ from zoneinfo import ZoneInfo
 from io import StringIO
 
 import paramiko
+import redis
 
 # ══════════════════════════════════════════════════════════════
 # CONFIG — same as dashboard_worker.py
@@ -47,6 +48,11 @@ PRICE_DIVISOR = 100.0
 NSE_OFFSET    = 315513000   # seconds
 
 OUTPUT_FILE = f"{REMOTE_DASHBOARD_DIR}/eod_positions.csv"
+
+# Redis for prev_close (stock_realtime_feeder — DB 2)
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB   = int(os.getenv("LTP_REDIS_DB", "2"))
 
 # ══════════════════════════════════════════════════════════════
 # LOGGING
@@ -305,7 +311,17 @@ def generate_eod_csv(dt: str = None):
     # Step 3: parse EOD from log
     eod = parse_eod_from_log(log_path)
 
-    # Step 4: build CSV rows
+    # Step 4: connect Redis for prev_close
+    try:
+        r = redis.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB,
+                        decode_responses=True, socket_timeout=2.0)
+        r.ping()
+        log.info("Redis connected for prev_close (DB %d)", REDIS_DB)
+    except Exception as e:
+        log.warning("Redis not available: %s — using last fill price as prev_close", e)
+        r = None
+
+    # Step 5: build CSV rows
     rows = []
     for token, v in eod.items():
         info = token_map.get(token)
@@ -313,12 +329,27 @@ def generate_eod_csv(dt: str = None):
             log.warning("Token %d not in contract map — skipping", token)
             continue
 
+        name = info["name"]
+
+        # Get prev_close from Redis fo:stock_spot:<SYM> close field
+        # Falls back to last fill price if Redis not available
+        prev_close = v["last_price"]  # fallback
+        if r:
+            try:
+                # Try stock spot close first
+                val = r.hget(f"fo:stock_spot:{name}", "close")
+                if val and float(val) > 0:
+                    prev_close = float(val)
+                    log.info("prev_close for %s from Redis: %.2f", name, prev_close)
+            except Exception:
+                pass
+
         rows.append({
             "token":          token,
             "symbol":         info["tsym"],
-            "name":           info["name"],
+            "name":           name,
             "qty_overnight":  v["net_qty"],
-            "prev_close":     round(v["last_price"], 2),
+            "prev_close":     round(prev_close, 2),
             "buy_qty":        v["buy_qty"],
             "sell_qty":       v["sell_qty"],
             "date":           dt,
