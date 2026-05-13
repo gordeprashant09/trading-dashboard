@@ -564,32 +564,32 @@ def get_ltp_redis() -> redis.Redis:
     )
 
 
-def load_lot_sizes_from_csv() -> dict[str, int]:
+def load_lot_sizes_from_redis() -> dict[str, int]:
     """
-    Read lot sizes from stocks.csv (same file used by feeder).
-    Format: symbol,lot_size,strike_step
-    Falls back to LOT_SIZE_FALLBACK if file not found.
+    Read lot sizes from Redis DB2 fo:stock_spot:<SYM> hash field lot_size.
+    Falls back to LOT_SIZE_FALLBACK if Redis not available or symbol missing.
     """
     result = {}
-    if not os.path.exists(STOCKS_CSV):
-        log.warning("stocks.csv not found: %s — using fallback", STOCKS_CSV)
-        return dict(LOT_SIZE_FALLBACK)
-
     try:
-        with open(STOCKS_CSV, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith("#") or line.startswith("symbol"):
-                    continue
-                parts = line.split(",")
-                if len(parts) < 2:
-                    continue
-                sym      = parts[0].strip().upper()
-                lot_size = int(float(parts[1].strip()))
-                result[sym] = lot_size
-        log.info("Lot sizes loaded from CSV: %d symbols", len(result))
+        r = redis.Redis(host=LTP_REDIS_HOST, port=LTP_REDIS_PORT,
+                        db=LTP_REDIS_DB, decode_responses=True, socket_timeout=2.0)
+        # Scan all fo:stock_spot:* keys
+        cursor = 0
+        while True:
+            cursor, keys = r.scan(cursor, match="fo:stock_spot:*", count=200)
+            for key in keys:
+                sym = key.split(":")[-1].upper()
+                val = r.hget(key, "lot_size")
+                if val:
+                    try:
+                        result[sym] = int(float(val))
+                    except ValueError:
+                        pass
+            if cursor == 0:
+                break
+        log.info("Lot sizes loaded from Redis DB%d: %d symbols", LTP_REDIS_DB, len(result))
     except Exception as e:
-        log.error("Error reading stocks.csv: %s", e)
+        log.warning("Redis lot size fetch failed: %s — using fallback", e)
 
     # merge fallback for any missing
     for sym, lot in LOT_SIZE_FALLBACK.items():
@@ -597,6 +597,11 @@ def load_lot_sizes_from_csv() -> dict[str, int]:
             result[sym] = lot
 
     return result
+
+
+# Keep old name as alias for backward compatibility
+def load_lot_sizes_from_csv() -> dict[str, int]:
+    return load_lot_sizes_from_redis()
 
 
 # Index names covered by fo_realtime_feeder (DB 0)
