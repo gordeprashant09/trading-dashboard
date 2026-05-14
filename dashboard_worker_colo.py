@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import os
 import re
+import csv
+import io
 import time
 import json
 import logging
@@ -63,13 +65,20 @@ DASH_REDIS_DB   = int(os.getenv("REDIS_DB",    "0"))
 
 DASH_REDIS_KEY  = "dashboard:positions:latest"
 
+# ── Day-end snapshot ───────────────────────────────────────────
+# Snapshot saved once per day when IST time crosses EOD_SNAPSHOT_TIME.
+# Filename: dashboard_snapshot_<YYYYMMDD>.csv  (date comes from log filename)
+# Saved to REMOTE_DASHBOARD_DIR/snapshots/ on the colo server via SFTP.
+EOD_SNAPSHOT_TIME = os.getenv("EOD_SNAPSHOT_TIME", "15:30")   # HH:MM IST
+SNAPSHOT_SUBDIR   = os.getenv("SNAPSHOT_SUBDIR",   "snapshots")  # under REMOTE_DASHBOARD_DIR
+
 # stocks.csv — same file used by stock_realtime_feeder
 # contains symbol, lot_size, strike_step
 STOCKS_CSV = os.getenv("STOCKS_CSV",
     "/home/report/devstudio/Prashant/Stock/stocks.csv")
 
 LOOP_SECONDS   = float(os.getenv("DASH_LOOP_SECONDS", "5.0"))
-EXPENSE_PER_CR = float(os.getenv("EXPENSE_PER_CR",    "10000"))
+EXPENSE_PER_CR = float(os.getenv("EXPENSE_PER_CR",    "1906"))
 
 # Price divisor — NSE FO prices in log are in paise (divide by 100)
 PRICE_DIVISOR  = 100.0
@@ -787,6 +796,172 @@ def dash_redis_client() -> redis.Redis:
 
 
 # ══════════════════════════════════════════════════════════════
+# DAY-END SNAPSHOT  — saves dashboard data to dated CSV on colo
+# ══════════════════════════════════════════════════════════════
+
+EXPENSE_PER_CR_SNAP = EXPENSE_PER_CR   # reuse global
+
+
+def _calc_pnl_for_snapshot(e: dict, lot_size: int) -> dict:
+    """Mirror of dashboard PnL engine — produces one row per expiry."""
+    qty_buy   = e["qty_today_buy"]
+    qty_sell  = e["qty_today_sell"]
+    qty_on    = e["qty_overnight"]
+    ltp       = e["ltp"]
+    prev_cl   = e["prev_close"]
+    b_avg     = e["buy_avg"]
+    s_avg     = e["sell_avg"]
+
+    net_today = qty_buy - qty_sell
+    open_qty  = qty_on + net_today
+    lots      = round(open_qty / lot_size, 2) if lot_size > 0 else None
+
+    carry     = qty_on * (ltp - prev_cl)
+    day_buy   = qty_buy  * (ltp - b_avg)  if qty_buy  > 0 else 0.0
+    day_sell  = qty_sell * (s_avg - ltp)  if qty_sell > 0 else 0.0
+    day       = day_buy + day_sell
+
+    tval      = (qty_buy  * (b_avg  or ltp)) + (qty_sell * (s_avg or ltp))
+    expenses  = (tval / 1e7) * EXPENSE_PER_CR_SNAP
+    net       = carry + day - expenses
+    net_exp   = open_qty * ltp
+
+    return {
+        "open_qty":   open_qty,
+        "lots":       lots,
+        "net_exp":    round(net_exp,   2),
+        "traded_val": round(tval,      2),
+        "carry_pnl":  round(carry,     2),
+        "day_pnl":    round(day,       2),
+        "expenses":   round(expenses,  2),
+        "net_pnl":    round(net,       2),
+    }
+
+
+def build_snapshot_rows(data: list[dict], as_of: str, log_date: str) -> list[dict]:
+    """
+    Flatten dashboard data into CSV rows.
+    One row per expiry, with parent stock aggregates included as extra cols.
+    Columns:
+        snapshot_time, trade_date, sym, lot_size,
+        expiry_label, ltp, qty_overnight, prev_close,
+        qty_today_buy, buy_avg, qty_today_sell, sell_avg,
+        open_qty, lots, net_exp, traded_val,
+        carry_pnl, day_pnl, expenses, net_pnl,
+        stock_net_pnl  (sum across all expiries for that stock)
+    """
+    rows = []
+    for stock in data:
+        sym      = stock["sym"]
+        lot_size = stock["lot_size"]
+
+        exp_pnls = [
+            _calc_pnl_for_snapshot(e, lot_size)
+            for e in stock["expiries"]
+        ]
+        stock_net_pnl = round(sum(p["net_pnl"] for p in exp_pnls), 2)
+
+        for e, pnl in zip(stock["expiries"], exp_pnls):
+            rows.append({
+                "snapshot_time":  as_of,
+                "trade_date":     log_date,
+                "sym":            sym,
+                "lot_size":       lot_size,
+                "expiry_label":   e["label"],
+                "ltp":            e["ltp"],
+                "qty_overnight":  e["qty_overnight"],
+                "prev_close":     e["prev_close"],
+                "qty_today_buy":  e["qty_today_buy"],
+                "buy_avg":        round(e["buy_avg"],  4),
+                "qty_today_sell": e["qty_today_sell"],
+                "sell_avg":       round(e["sell_avg"], 4),
+                "open_qty":       pnl["open_qty"],
+                "lots":           pnl["lots"],
+                "net_exp":        pnl["net_exp"],
+                "traded_val":     pnl["traded_val"],
+                "carry_pnl":      pnl["carry_pnl"],
+                "day_pnl":        pnl["day_pnl"],
+                "expenses":       pnl["expenses"],
+                "net_pnl":        pnl["net_pnl"],
+                "stock_net_pnl":  stock_net_pnl,
+            })
+    return rows
+
+
+def save_snapshot_to_colo(data: list[dict], as_of: str, log_date: str) -> bool:
+    """
+    Build a dated CSV from current dashboard data and write it to
+    REMOTE_DASHBOARD_DIR/snapshots/dashboard_snapshot_<YYYYMMDD>.csv
+    on the colo server via SFTP.
+
+    log_date : trade date string — either 'YYYY-MM-DD' or 'YYYYMMDD'
+    Returns True on success, False on any error.
+    """
+    # Normalise date to YYYYMMDD for filename
+    try:
+        if "-" in log_date:
+            date_tag = datetime.strptime(log_date, "%Y-%m-%d").strftime("%Y%m%d")
+        else:
+            date_tag = log_date[:8]   # already YYYYMMDD
+    except Exception:
+        date_tag = date.today().strftime("%Y%m%d")
+
+    remote_dir  = f"{REMOTE_DASHBOARD_DIR}/{SNAPSHOT_SUBDIR}"
+    remote_path = f"{remote_dir}/dashboard_snapshot_{date_tag}.csv"
+
+    rows = build_snapshot_rows(data, as_of, log_date)
+    if not rows:
+        log.warning("Snapshot: no data rows to save — skipping")
+        return False
+
+    # Build CSV in memory
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=list(rows[0].keys()))
+    writer.writeheader()
+    writer.writerows(rows)
+    csv_bytes = buf.getvalue().encode("utf-8")
+
+    # Upload via SFTP
+    try:
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(SSH_HOST, port=SSH_PORT,
+                       username=SSH_USER, password=SSH_PASS, timeout=15)
+        sftp = client.open_sftp()
+
+        # Ensure remote directory exists
+        try:
+            sftp.stat(remote_dir)
+        except FileNotFoundError:
+            # mkdir -p equivalent via SSH command
+            client.exec_command(f"mkdir -p {remote_dir}")
+            time.sleep(0.5)   # give shell a moment
+
+        with sftp.open(remote_path, "wb") as f:
+            f.write(csv_bytes)
+
+        sftp.close()
+        client.close()
+        log.info("Snapshot saved → %s:%s  (%d rows)", SSH_HOST, remote_path, len(rows))
+        return True
+
+    except Exception as e:
+        log.error("Snapshot SFTP upload failed: %s", e)
+        return False
+
+
+def should_take_snapshot(now_ist: datetime, last_snapshot_date: date) -> bool:
+    """
+    Return True exactly once per calendar day, after EOD_SNAPSHOT_TIME IST.
+    Prevents repeated saves if the worker loop runs past 15:30 many times.
+    """
+    eod_h, eod_m = map(int, EOD_SNAPSHOT_TIME.split(":"))
+    after_cutoff = (now_ist.hour, now_ist.minute) >= (eod_h, eod_m)
+    new_day      = now_ist.date() > last_snapshot_date
+    return after_cutoff and new_day
+
+
+# ══════════════════════════════════════════════════════════════
 # MAIN LOOP
 # ══════════════════════════════════════════════════════════════
 
@@ -815,6 +990,14 @@ def main():
     # Cache token map — reload on new day
     current_log  = log_file_path()
     token_map    = load_token_map(current_log)
+
+    # Snapshot tracker — stores the date of the last saved snapshot
+    # Initialise to yesterday so a snapshot can be taken today if already past 15:30
+    IST = ZoneInfo("Asia/Kolkata")
+    last_snapshot_date: date = date.today() - timedelta(days=1)
+    last_good_data: list     = []   # last non-empty positions payload
+    last_good_as_of: str     = ""
+    last_good_log_date: str  = ""
 
     while True:
         tick_start = time.time()
@@ -862,16 +1045,17 @@ def main():
 
             # 7. Publish to Redis
             # Extract date from log filename e.g. 20260509
-            import re as _re
-            _m = _re.search(r"(\d{8})", os.path.basename(latest_log))
+            _m = re.search(r"(\d{8})", os.path.basename(latest_log))
             _log_date_str = _m.group(1) if _m else ""
             try:
                 _log_date_fmt = datetime.strptime(_log_date_str, "%Y%m%d").strftime("%Y-%m-%d")
             except Exception:
                 _log_date_fmt = _log_date_str
 
+            _as_of = datetime.now().isoformat(timespec="seconds")
+
             payload = json.dumps({
-                "as_of":     datetime.now().isoformat(timespec="seconds"),
+                "as_of":     _as_of,
                 "log_date":  _log_date_fmt,
                 "positions": data,
                 "source":    "log_file",
@@ -879,6 +1063,25 @@ def main():
 
             r_dash.set(DASH_REDIS_KEY, payload)
             log.info("Published %d stocks to Redis key=%s", len(data), DASH_REDIS_KEY)
+
+            # Keep last good snapshot in memory for EOD save
+            if data:
+                last_good_data      = data
+                last_good_as_of     = _as_of
+                last_good_log_date  = _log_date_fmt
+
+            # ── 8. Day-end snapshot check ────────────────────────────
+            now_ist = datetime.now(tz=IST)
+            if should_take_snapshot(now_ist, last_snapshot_date):
+                snap_data     = last_good_data or data
+                snap_as_of    = last_good_as_of or _as_of
+                snap_log_date = last_good_log_date or _log_date_fmt
+                log.info("EOD snapshot triggered at %s IST", now_ist.strftime("%H:%M:%S"))
+                ok = save_snapshot_to_colo(snap_data, snap_as_of, snap_log_date)
+                if ok:
+                    last_snapshot_date = now_ist.date()
+                else:
+                    log.warning("Snapshot failed — will retry next tick")
 
         except Exception as e:
             import traceback
