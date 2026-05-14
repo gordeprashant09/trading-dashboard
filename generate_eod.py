@@ -2,13 +2,13 @@
 generate_eod.py
 ===============
 Run this script at End of Day (after 3:30 PM) to generate
-eod_positions.csv from today's log file.
+a dated EOD positions CSV from today's log file.
 
 This CSV is used by dashboard_worker.py next morning as
 overnight positions (qty_overnight + prev_close).
 
 Output:
-    [SSH] 192.168.74.138:/data/Dashboard/eod_positions.csv
+    [SSH] 192.168.74.138:/data/Dashboard/Eod/eod_positions_YYYYMMDD.csv
 
 Usage:
     python generate_eod.py              # uses today's date
@@ -47,7 +47,16 @@ REMOTE_PCAP_DIR      = os.getenv("REMOTE_PCAP_DIR",      "/data/pcapdata")
 PRICE_DIVISOR = 100.0
 NSE_OFFSET    = 315513000   # seconds
 
-OUTPUT_FILE = f"{REMOTE_DASHBOARD_DIR}/eod_positions.csv"
+EOD_SUBDIR = "Eod"   # subfolder under REMOTE_DASHBOARD_DIR
+
+
+def eod_output_path(dt: str) -> str:
+    """
+    Returns dated EOD CSV path on colo.
+    e.g. /data/Dashboard/Eod/eod_positions_20260514.csv
+    dt must be YYYYMMDD.
+    """
+    return f"{REMOTE_DASHBOARD_DIR}/{EOD_SUBDIR}/eod_positions_{dt}.csv"
 
 # Redis for prev_close (stock_realtime_feeder — DB 2)
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
@@ -360,7 +369,13 @@ def generate_eod_csv(dt: str = None):
         log.error("No rows generated — check log and contract file")
         return
 
-    # Step 5: write CSV to remote
+    # Step 5: write CSV to remote dated path
+    output_file = eod_output_path(dt)
+    remote_eod_dir = f"{REMOTE_DASHBOARD_DIR}/{EOD_SUBDIR}"
+
+    # Ensure /data/Dashboard/Eod/ exists on colo
+    run_remote_cmd(f"mkdir -p {remote_eod_dir}")
+
     buf = StringIO()
     writer = csv.DictWriter(buf, fieldnames=[
         "token", "symbol", "name",
@@ -371,14 +386,14 @@ def generate_eod_csv(dt: str = None):
     writer.writeheader()
     writer.writerows(rows)
 
-    write_remote_file(OUTPUT_FILE, buf.getvalue())
+    write_remote_file(output_file, buf.getvalue())
 
     # Step 6: summary
     log.info("=" * 55)
     log.info("  EOD CSV generated successfully!")
     log.info("  Date     : %s", dt)
     log.info("  Tokens   : %d", len(rows))
-    log.info("  Output   : %s:%s", SSH_HOST, OUTPUT_FILE)
+    log.info("  Output   : %s:%s", SSH_HOST, output_file)
     log.info("=" * 55)
 
     # Print summary table
@@ -391,6 +406,7 @@ def generate_eod_csv(dt: str = None):
         print(f"{r['symbol']:<30} {net:>10.0f} {r['prev_close']:>12.2f}  {direction}")
     print("-" * 55)
     print(f"Total positions: {len(rows)}")
+    print(f"Saved to       : {SSH_HOST}:{output_file}")
     print()
 
 
