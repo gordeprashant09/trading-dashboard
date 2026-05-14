@@ -725,7 +725,7 @@ def main():
         st.session_state.expanded_syms = set()
 
     # Auto-refresh every 10 seconds — preserves expand/collapse state
-    st_autorefresh(interval=10000, key="dashboard_refresh")
+    st_autorefresh(interval=5000, key="dashboard_refresh")
 
     # Load data FIRST so session state is set before rendering
     data = load_data()
