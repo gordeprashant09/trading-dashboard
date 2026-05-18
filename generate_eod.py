@@ -157,15 +157,35 @@ def today_str() -> str:
 def detect_latest_log() -> tuple[str, str]:
     """
     Returns (log_path, date_str) of the latest log on remote.
+    Uses actual fill timestamps (not filename) for accurate trade date.
     """
     path = run_remote_cmd(
-        f"ls -t {REMOTE_LOG_DIR}/Sample-Strategy-excution_algo_1_*.log 2>/dev/null | head -1"
+        f"ls -t {REMOTE_LOG_DIR}/Sample-Strategy_algo_1_*.log 2>/dev/null | head -1"
     )
     if not path:
         raise FileNotFoundError("No log file found on remote server")
-    # Extract date from filename
-    m = re.search(r"(\d{8})", os.path.basename(path))
-    dt = m.group(1) if m else today_str()
+
+    # Extract actual trade date from latest fill timestamp (not filename)
+    # Filename date may be stale — fill timestamps are accurate
+    last_fill = run_remote_cmd(
+        f"timeout 10 tac {path} | grep -m1 'emit_trade_fill::FTRD'"
+    )
+    dt = today_str()  # fallback
+    if last_fill:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})\s", last_fill)
+        if m:
+            try:
+                dt = datetime.strptime(m.group(1), "%Y-%m-%d").strftime("%Y%m%d")
+                log.info("Trade date from fill timestamp: %s", dt)
+            except Exception:
+                pass
+
+    if dt == today_str():
+        # fallback: try filename date
+        m = re.search(r"(\d{8})", os.path.basename(path))
+        if m:
+            dt = m.group(1)
+
     return path, dt
 
 
@@ -246,16 +266,57 @@ def load_token_map(contract_path: str) -> dict[int, dict]:
 
 def parse_eod_from_log(log_path: str) -> dict[int, dict]:
     """
-    Parse all FTRD lines from log.
+    Parse FTRD lines from log for the latest trade date only.
+
+    Uses server-side grep to fetch only today's fills — avoids reading
+    entire 1.7GB accumulated log file which contains multiple days.
+
     Returns { token: { net_qty, last_price, buy_qty, sell_qty } }
     net_qty    = total_buy - total_sell  → qty_overnight for next day
     last_price = last fill price         → prev_close for next day
     """
-    lines = read_remote_file_lines(log_path)
-    eod: dict[int, dict] = {}
+    # Step 1: get latest fill date using tac (fast — reads from end)
+    last_fill = run_remote_cmd(
+        f"timeout 10 tac {log_path} | grep -m1 'emit_trade_fill::FTRD'"
+    )
+    latest_date = None
+    if last_fill:
+        m = re.search(r"(\d{4}-\d{2}-\d{2})\s", last_fill)
+        if m:
+            latest_date = m.group(1)
+            log.info("EOD: filtering fills for date %s", latest_date)
 
-    # Deduplicate by (token, fillnumber) — same as worker
+    # Step 2: grep only today's fills server-side
+    if latest_date:
+        raw = run_remote_cmd(
+            f"grep 'emit_trade_fill::FTRD' {log_path} | grep '{latest_date}'"
+        )
+    else:
+        log.warning("EOD: could not detect latest date — processing all fills")
+        raw = run_remote_cmd(f"grep 'emit_trade_fill::FTRD' {log_path}")
+
+    lines = raw.splitlines() if raw else []
+    log.info("EOD: %d fill lines found for date %s", len(lines), latest_date)
+
+    eod: dict[int, dict] = {}
     seen: dict[tuple, dict] = {}
+
+    for line in lines:
+        m = FTRD_RE.search(line)
+        if not m:
+            continue
+        try:
+            token      = int(m.group(10))
+            fillnumber = int(m.group(7))
+            seen[(token, fillnumber)] = {
+                "token":      token,
+                "buy_sell":   int(m.group(3)),
+                "fillqty":    int(m.group(8)),
+                "fillprice":  int(m.group(9)) / PRICE_DIVISOR,
+                "fillnumber": fillnumber,
+            }
+        except (ValueError, IndexError):
+            continue
     for line in lines:
         m = FTRD_RE.search(line)
         if not m:
