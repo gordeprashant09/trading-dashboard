@@ -1008,6 +1008,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <col style="width:80px">   <!-- Buy Avg -->
       <col style="width:80px">   <!-- Sell Avg -->
       <col style="width:55px">   <!-- Carry Lots -->
+      <col style="width:70px">   <!-- Carry Avg -->
       <col style="width:55px">   <!-- Lots -->
       <col style="width:20px">   <!-- mismatch -->
       <col style="width:70px">   <!-- Carry Exp.(Cr) -->
@@ -1038,6 +1039,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <th>Buy Avg</th>
       <th>Sell Avg</th>
       <th>Carry Lots</th>
+      <th style="color:#565c6e">Carry Avg</th>
       <th>Lots</th>
       <th title="Signal/Lots mismatch">⚡</th>
       <th>Carry Exp.(Cr)</th>
@@ -1140,6 +1142,12 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         # Carry Lots td
         cl = round(float(s_carry_lots), 1)
         carry_lots_td = f'<td style="color:#7a8294">{("+" if cl > 0 else "") + str(cl)}</td>' if cl != 0 else '<td class="zer">0.0</td>'
+        # Carry Avg = prev_close from latest expiry
+        _carry_prev = 0.0
+        if item["expiries"]:
+            _le = sorted(item["expiries"], key=lambda x: x["label"])[-1]
+            _carry_prev = _le.get("prev_close", 0.0) or 0.0
+        carry_avg_td = f'<td style="color:#565c6e;font-size:10px">{f"{_carry_prev:,.2f}" if _carry_prev else "—"}</td>'
 
         # Net Exp in Cr
         net_exp_cr = s_net_exp / 1e7
@@ -1171,6 +1179,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
           <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_b_avg}</td>
           <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_s_avg}</td>
           {carry_lots_td}
+          {carry_avg_td}
           {lots_td}
           {mismatch_td(final_sig, stock_lots)}
           <td style="color:#7a8294;text-align:right;padding-right:12px">{s_carry_exp_cr:+.2f}</td>
@@ -1217,6 +1226,8 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                 # Carry Lots
                 ecl = round(float(ec["carry_lots"]), 1)
                 carry_lots_td_exp = f'<td style="color:#7a8294">{("+" if ecl > 0 else "") + str(ecl)}</td>' if ecl != 0 else '<td class="zer">0.0</td>'
+                _ec_prev = ec.get("prev_close", 0.0) or 0.0
+                carry_avg_td_exp = f'<td style="color:#565c6e;font-size:10px">{f"{_ec_prev:,.2f}" if _ec_prev else "—"}</td>'
 
                 # Net Exp in Cr
                 ec_net_exp_cr = ec["net_exp"] / 1e7
@@ -1241,6 +1252,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{b_str}</td>
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{s_str}</td>
                   {carry_lots_td_exp}
+                  {carry_avg_td_exp}
                   {lh}
                   {mismatch_td(final_sig, ec.get("lots"))}
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{ec_carry_exp_cr:+.2f}</td>
@@ -1564,6 +1576,45 @@ def main():
     st.html("<div class='section-hdr'>Position Book — Intraday</div>")
 
     # ── Single unified position table ───────────────────────
+    # ── Sort controls ────────────────────────────────────────────────────────
+    _sort_opts = ["Default", "Net PnL ↓", "Net PnL ↑", "Day PnL ↓", "Day PnL ↑",
+                  "Carry PnL ↓", "Carry PnL ↑", "Lots ↓", "Lots ↑",
+                  "Traded Val ↓", "Traded Val ↑", "Symbol A-Z", "Symbol Z-A"]
+    _sc1, _sc2, _sc3 = st.columns([1, 1, 4])
+    with _sc1:
+        _sort_by = st.selectbox("Sort by", _sort_opts,
+                                key="pos_sort", label_visibility="collapsed",
+                                index=0)
+    with _sc2:
+        _filter_sym = st.text_input("Filter symbol", key="pos_filter",
+                                    placeholder="Filter symbol...",
+                                    label_visibility="collapsed")
+
+    # Apply sort
+    def _sort_key(item):
+        ec = [calc_expiry_pnl(e, item["lot_size"]) for e in item["expiries"]]
+        if _sort_by in ("Net PnL ↓","Net PnL ↑"):
+            return sum(x["net"] for x in ec)
+        if _sort_by in ("Day PnL ↓","Day PnL ↑"):
+            return sum(x["day"] for x in ec)
+        if _sort_by in ("Carry PnL ↓","Carry PnL ↑"):
+            return sum(x["carry"] for x in ec)
+        if _sort_by in ("Lots ↓","Lots ↑"):
+            return sum(x["open_qty"] for x in ec)
+        if _sort_by in ("Traded Val ↓","Traded Val ↑"):
+            return sum(x["traded_val"] for x in ec)
+        if _sort_by in ("Symbol A-Z","Symbol Z-A"):
+            return item["sym"]
+        return 0
+
+    _asc = "↑" in _sort_by or "A-Z" in _sort_by
+    if _sort_by != "Default":
+        data = sorted(data, key=_sort_key, reverse=not _asc)
+
+    # Apply symbol filter
+    if _filter_sym.strip():
+        data = [d for d in data if _filter_sym.strip().upper() in d["sym"].upper()]
+
     table_html = build_position_table_html(
         data,
         expand_all    = st.session_state.expand_all,

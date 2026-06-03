@@ -1008,6 +1008,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <col style="width:80px">   <!-- Buy Avg -->
       <col style="width:80px">   <!-- Sell Avg -->
       <col style="width:55px">   <!-- Carry Lots -->
+      <col style="width:70px">   <!-- Carry Avg -->
       <col style="width:55px">   <!-- Lots -->
       <col style="width:20px">   <!-- mismatch -->
       <col style="width:70px">   <!-- Carry Exp.(Cr) -->
@@ -1030,26 +1031,27 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
     {COLS}
     <thead><tr>
       <th class="left"></th>
-      <th class="left">Symbol / Expiry</th>
+      <th class="left" style="cursor:pointer"><a href="__HREF_sym__" style="text-decoration:none;color:inherit">Symbol / Expiry <span style="color:__SC_sym__;font-size:11px;font-weight:bold">__SA_sym__</span></a></th>
       <th>Token</th>
       <th>Real Sig</th>
       <th>Final Sig</th>
-      <th>LTP</th>
+      <th style="cursor:pointer"><a href="__HREF_ltp__" style="text-decoration:none;color:inherit">LTP <span style="color:__SC_ltp__;font-size:11px;font-weight:bold">__SA_ltp__</span></a></th>
       <th>Buy Avg</th>
       <th>Sell Avg</th>
       <th>Carry Lots</th>
-      <th>Lots</th>
+      <th style="color:#565c6e">Carry Avg</th>
+      <th style="cursor:pointer"><a href="__HREF_lots__" style="text-decoration:none;color:inherit">Lots <span style="color:__SC_lots__;font-size:11px;font-weight:bold">__SA_lots__</span></a></th>
       <th title="Signal/Lots mismatch">⚡</th>
       <th>Carry Exp.(Cr)</th>
-      <th>Net Exp.(Cr)</th>
-      <th>Traded Val(Cr)</th>
+      <th style="cursor:pointer"><a href="__HREF_netexp__" style="text-decoration:none;color:inherit">Net Exp.(Cr) <span style="color:__SC_netexp__;font-size:11px;font-weight:bold">__SA_netexp__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_tv__" style="text-decoration:none;color:inherit">Traded Val(Cr) <span style="color:__SC_tv__;font-size:11px;font-weight:bold">__SA_tv__</span></a></th>
       <th>Cost</th>
       <th>Cost%(Bips)</th>
-      <th>Carry PnL</th>
-      <th style="color:#2eca8a">Realized</th>
-      <th style="color:#e8a825">Unrealized</th>
-      <th>Day PnL</th>
-      <th>Net PnL</th>
+      <th style="cursor:pointer"><a href="__HREF_carry__" style="text-decoration:none;color:inherit">Carry PnL <span style="color:__SC_carry__;font-size:11px;font-weight:bold">__SA_carry__</span></a></th>
+      <th style="color:#2eca8a;cursor:pointer"><a href="__HREF_real__" style="text-decoration:none;color:inherit">Realized <span style="color:__SC_real__;font-size:11px;font-weight:bold">__SA_real__</span></a></th>
+      <th style="color:#e8a825;cursor:pointer"><a href="__HREF_unreal__" style="text-decoration:none;color:inherit">Unrealized <span style="color:__SC_unreal__;font-size:11px;font-weight:bold">__SA_unreal__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_day__" style="text-decoration:none;color:inherit">Day PnL <span style="color:__SC_day__;font-size:11px;font-weight:bold">__SA_day__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_net__" style="text-decoration:none;color:inherit">Net PnL <span style="color:__SC_net__;font-size:11px;font-weight:bold">__SA_net__</span></a></th>
       <th>PnL%</th>
       <th>Slippage (bp)</th>
       <th>INR Slip (bp)</th>
@@ -1140,6 +1142,12 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         # Carry Lots td
         cl = round(float(s_carry_lots), 1)
         carry_lots_td = f'<td style="color:#7a8294">{("+" if cl > 0 else "") + str(cl)}</td>' if cl != 0 else '<td class="zer">0.0</td>'
+        # Carry Avg = prev_close from latest expiry
+        _carry_prev = 0.0
+        if item["expiries"]:
+            _le = sorted(item["expiries"], key=lambda x: x["label"])[-1]
+            _carry_prev = _le.get("prev_close", 0.0) or 0.0
+        carry_avg_td = f'<td style="color:#565c6e;font-size:10px">{f"{_carry_prev:,.2f}" if _carry_prev else "—"}</td>'
 
         # Net Exp in Cr
         net_exp_cr = s_net_exp / 1e7
@@ -1171,6 +1179,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
           <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_b_avg}</td>
           <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_s_avg}</td>
           {carry_lots_td}
+          {carry_avg_td}
           {lots_td}
           {mismatch_td(final_sig, stock_lots)}
           <td style="color:#7a8294;text-align:right;padding-right:12px">{s_carry_exp_cr:+.2f}</td>
@@ -1217,6 +1226,8 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                 # Carry Lots
                 ecl = round(float(ec["carry_lots"]), 1)
                 carry_lots_td_exp = f'<td style="color:#7a8294">{("+" if ecl > 0 else "") + str(ecl)}</td>' if ecl != 0 else '<td class="zer">0.0</td>'
+                _ec_prev = ec.get("prev_close", 0.0) or 0.0
+                carry_avg_td_exp = f'<td style="color:#565c6e;font-size:10px">{f"{_ec_prev:,.2f}" if _ec_prev else "—"}</td>'
 
                 # Net Exp in Cr
                 ec_net_exp_cr = ec["net_exp"] / 1e7
@@ -1241,6 +1252,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{b_str}</td>
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{s_str}</td>
                   {carry_lots_td_exp}
+                  {carry_avg_td_exp}
                   {lh}
                   {mismatch_td(final_sig, ec.get("lots"))}
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{ec_carry_exp_cr:+.2f}</td>
@@ -1419,6 +1431,18 @@ def main():
 
     # Handle toggle via query params (set by the HTML anchor links)
     qp = st.query_params
+
+    # Handle sort via query params (?sort=col&asc=0 or asc=1)
+    # State lives in URL — survives autorefresh
+    sort_col = qp.get("sort", None)
+    if sort_col:
+        # asc=1 means ascending was requested by the link
+        asc_param = qp.get("asc", "0")
+        st.session_state["sort_col"] = sort_col
+        st.session_state["sort_asc"] = (asc_param == "1")
+        st.query_params.clear()
+        st.rerun()
+
     tog_sym = qp.get("tog", None)
     if tog_sym:
         if tog_sym == "__all__":
@@ -1564,11 +1588,61 @@ def main():
     st.html("<div class='section-hdr'>Position Book — Intraday</div>")
 
     # ── Single unified position table ───────────────────────
+    # Apply sort from session state (set by clicking column headers)
+    _active_sort_col = st.session_state.get("sort_col", None)
+    _active_sort_asc = st.session_state.get("sort_asc", False)
+
+    _SORT_KEY_MAP = {
+        "sym":    lambda item, ec: item["sym"],
+        "net":    lambda item, ec: sum(x["net"]        for x in ec),
+        "day":    lambda item, ec: sum(x["day"]        for x in ec),
+        "carry":  lambda item, ec: sum(x["carry"]      for x in ec),
+        "lots":   lambda item, ec: sum(x["open_qty"]   for x in ec),
+        "tv":     lambda item, ec: sum(x["traded_val"] for x in ec),
+        "real":   lambda item, ec: sum(x.get("realized",0) for x in ec),
+        "unreal": lambda item, ec: sum(x.get("unrealized",0) for x in ec),
+        "netexp": lambda item, ec: sum(x["net_exp"]    for x in ec),
+    }
+    if _active_sort_col and _active_sort_col in _SORT_KEY_MAP:
+        _fn = _SORT_KEY_MAP[_active_sort_col]
+        def _sort_key_with_zeros(item):
+            ec  = [calc_expiry_pnl(e, item["lot_size"]) for e in item["expiries"]]
+            val = _fn(item, ec)
+            tv  = sum(x["traded_val"] for x in ec)
+            oq  = sum(abs(x["open_qty"]) for x in ec)
+            # Push no-activity rows (no trades, no open position) to bottom
+            has_activity = tv > 0 or oq > 0
+            if isinstance(val, str):
+                return (1, val)  # symbol sort — no zero penalty
+            return (0 if has_activity else 1, -val if not _active_sort_asc else val)
+        data = sorted(data, key=_sort_key_with_zeros)
+
+    # Replace sort arrow placeholders with actual state
+    _SORT_COLS = ["sym","ltp","lots","netexp","tv","carry","real","unreal","day","net"]
+    def _sa(col):
+        if _active_sort_col != col: return "⇅"
+        return "↑" if _active_sort_asc else "↓"
+
+    def _href(col):
+        # Next click toggles direction if same col, else desc
+        if _active_sort_col == col:
+            next_asc = 0 if _active_sort_asc else 1
+        else:
+            next_asc = 0
+        return f"?sort={col}&asc={next_asc}"
+    def _sc(col): return "#2eca8a" if (_active_sort_col==col and not _active_sort_asc) else ("#ff9f43" if (_active_sort_col==col and _active_sort_asc) else "#3a4055")
+
     table_html = build_position_table_html(
         data,
         expand_all    = st.session_state.expand_all,
         expanded_syms = st.session_state.expanded_syms,
     )
+    # Apply sort arrow + href placeholders
+    for _c in _SORT_COLS:
+        table_html = table_html.replace(f"__SA_{_c}__",   _sa(_c))
+        table_html = table_html.replace(f"__SC_{_c}__",   _sc(_c))
+        table_html = table_html.replace(f"__HREF_{_c}__", _href(_c))
+
     st.html(f"""
     <div style="overflow-x:auto; width:100%; transform:rotateX(180deg); -webkit-transform:rotateX(180deg);">
         <div style="transform:rotateX(180deg); -webkit-transform:rotateX(180deg);">

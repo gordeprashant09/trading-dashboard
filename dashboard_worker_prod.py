@@ -419,29 +419,35 @@ def prev_trading_date() -> str:
 
 def log_file_path(dt: str = None) -> str:
     """
-    Auto-detect the latest Sample-Strategy_algo_1_*.log on remote server.
-    Falls back to today date filename if detection fails.
+    Find today's algo log on remote server.
+    Searches for *algo_1_YYYYMMDD.log pattern for today's date only.
+    Never falls back to yesterday's log.
     """
+    dt = dt or today_str()
+
     try:
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         client.connect(SSH_HOST, port=SSH_PORT,
                        username=SSH_USER, password=SSH_PASS,
                        timeout=10)
+        # Find any algo_1 log for today's date
         _, stdout, _ = client.exec_command(
-            f"ls -t {REMOTE_LOG_DIR}/*algo_1_*.log 2>/dev/null | head -1"
+            f"ls {REMOTE_LOG_DIR}/*algo_1_{dt}.log 2>/dev/null | head -1"
         )
-        path = stdout.read().decode().strip()
+        found = stdout.read().decode().strip()
         client.close()
-        if path:
-            log.info("Auto-detected latest log: %s", path)
-            return path
-    except Exception as e:
-        log.warning("Could not auto-detect log file: %s", e)
 
-    # fallback
-    dt = dt or today_str()
-    return f"{REMOTE_LOG_DIR}/Sample-Strategy_algo_1_{dt}.log"
+        if found:
+            log.info("Today's log found: %s", found)
+            return found
+        else:
+            log.warning("Today's log not yet available for date %s — will retry next cycle", dt)
+            # Return expected path (worker will retry next cycle)
+            return f"{REMOTE_LOG_DIR}/*algo_1_{dt}.log"
+    except Exception as e:
+        log.warning("Could not check log file: %s", e)
+        return f"{REMOTE_LOG_DIR}/*algo_1_{dt}.log"
 
 
 # Remote contract base dir
@@ -1000,8 +1006,10 @@ def _eod_from_csv(dt: str) -> dict[int, dict]:
             result[token] = {
                 "qty_overnight": qty_overnight,
                 "prev_close":    prev_close,
-                "name":          row.get("name", ""),   # for rollover lookup
+                "name":          row.get("name", ""),
                 "symbol":        row.get("symbol", ""),
+                "buy_avg":       float(row.get("buy_avg",  0) or 0),
+                "sell_avg":      float(row.get("sell_avg", 0) or 0),
             }
         except (KeyError, ValueError):
             continue
@@ -1426,8 +1434,8 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict, slip_engine=No
             "prev_close":      prev_close,
             "qty_today_buy":   qty_today_buy,
             "qty_today_sell":  qty_today_sell,
-            "buy_avg":         p["buy_avg"],
-            "sell_avg":        p["sell_avg"],
+            "buy_avg":         p["buy_avg"]  or eod_map.get(token, {}).get("buy_avg",  0.0),
+            "sell_avg":        p["sell_avg"] or eod_map.get(token, {}).get("sell_avg", 0.0),
             "ltp":             ltp,
             "mtd":             0.0,
             "slippage":        slippage,
@@ -1676,6 +1684,12 @@ def main():
                 log.info("New log file detected — reloading contract map: %s", latest_log)
                 token_map   = load_token_map(latest_log)
                 current_log = latest_log
+            # Retry token map if empty (contract file not yet available)
+            if not token_map:
+                log.warning("Token map empty — retrying contract file load...")
+                token_map = load_token_map(latest_log)
+                if token_map:
+                    log.info("Token map loaded on retry: %d contracts", len(token_map))
 
             # 1. Parse FTRD fills from log
             fills = parse_ftrd_lines(latest_log)
