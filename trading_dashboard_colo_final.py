@@ -19,6 +19,8 @@ To connect live data:
 from __future__ import annotations
 
 import os
+import io
+import csv
 import time
 import math
 from datetime import datetime, date
@@ -50,8 +52,16 @@ REDIS_HOST       = os.getenv("REDIS_HOST",       "localhost")
 REDIS_PORT       = int(os.getenv("REDIS_PORT",   "6379"))
 LTP_HASH_KEY     = os.getenv("LTP_HASH_KEY",     "last_price")
 
-EXPENSE_PER_CR   = float(os.getenv("EXPENSE_PER_CR", "0"))
+EXPENSE_PER_CR   = float(os.getenv("EXPENSE_PER_CR", "1906"))
 REFRESH_SECONDS  = int(os.getenv("REFRESH_SECONDS",  "10"))
+
+# ── Snapshot config (mirrors dashboard_worker.py) ────────────
+SSH_HOST             = os.getenv("SSH_HOST",             "192.168.74.138")
+SSH_PORT             = int(os.getenv("SSH_PORT",         "22"))
+SSH_USER             = os.getenv("SSH_USER",             "Data_colo")
+SSH_PASS             = os.getenv("SSH_PASS",             "Datacolo@2026")
+REMOTE_DASHBOARD_DIR = os.getenv("REMOTE_DASHBOARD_DIR", "/data/Dashboard")
+SNAPSHOT_SUBDIR      = os.getenv("SNAPSHOT_SUBDIR",      "snapshots")
 
 # ============================================================
 # DUMMY DATA
@@ -288,25 +298,55 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     day_sell = e["qty_today_sell"] * (e["sell_avg"] - e["ltp"]) if e["qty_today_sell"] > 0 else 0
     day      = day_buy + day_sell
 
-    # Expenses
-    traded_val = (e["qty_today_buy"]  * (e["buy_avg"]  or e["ltp"])) + \
-                 (e["qty_today_sell"] * (e["sell_avg"] or e["ltp"]))
-    expenses   = (traded_val / 1e7) * EXPENSE_PER_CR
+    # Expenses — split buy/sell side costs
+    buy_val    = e["qty_today_buy"]  * (e["buy_avg"]  or e["ltp"])
+    sell_val   = e["qty_today_sell"] * (e["sell_avg"] or e["ltp"])
+    traded_val = buy_val + sell_val
+    buy_cost   = (buy_val  / 1e7) * 1018
+    sell_cost  = (sell_val / 1e7) * 5818
+    expenses   = buy_cost + sell_cost
 
     net     = carry + day - expenses
     net_exp = open_qty * e["ltp"]
 
+    # PnL% — based on direction of open position
+    # Only calculated when relevant avg price exists (intraday fills)
+    # Shows — for overnight-only positions (no fills today)
+    pnl_pct = None
+    b_avg = e.get("buy_avg", 0.0)
+    s_avg = e.get("sell_avg", 0.0)
+    ltp   = e["ltp"]
+    if lots is not None:
+        if lots > 0 and b_avg and b_avg > 0:
+            # Long position — need buy_avg from today's fills
+            pnl_pct = (ltp - b_avg) / b_avg * 100
+        elif lots < 0 and s_avg and s_avg > 0 and ltp and ltp > 0:
+            # Short position — need sell_avg from today's fills
+            pnl_pct = (s_avg - ltp) / ltp * 100
+        # else: overnight only (no fills) → pnl_pct stays None → shows —
+
+    carry_lots   = e["qty_overnight"] / lot_size if lot_size > 0 else 0.0
+    carry_exp_cr = (e["qty_overnight"] * e["ltp"]) / 1e7  # in Crores
+
     return {
-        "label":      e["label"],
-        "ltp":        e["ltp"],
-        "lots":       lots,
-        "open_qty":   open_qty,
-        "net_exp":    net_exp,
-        "traded_val": traded_val,
-        "carry":      carry,
-        "day":        day,
-        "net":        net,
-        "mtd":        e.get("mtd", 0),
+        "label":        e["label"],
+        "token":        e.get("token", ""),
+        "ltp":          e["ltp"],
+        "buy_avg":      e.get("buy_avg",  0.0),
+        "sell_avg":     e.get("sell_avg", 0.0),
+        "carry_lots":   carry_lots,
+        "carry_exp_cr": carry_exp_cr,
+        "lots":         lots,
+        "open_qty":     open_qty,
+        "net_exp":      net_exp,
+        "traded_val":   traded_val,
+        "cost":         expenses,
+        "cost_pct":     round((expenses / traded_val * 100), 4) if traded_val else 0.0,
+        "carry":        carry,
+        "day":          day,
+        "net":          net,
+        "pnl_pct":      pnl_pct,
+        "mtd":          e.get("mtd", 0),
     }
 
 
@@ -425,14 +465,18 @@ st.html("""
     font-size: 12px;
     table-layout: fixed;
 }
-.dash-table colgroup col:nth-child(1) { width: 5%; }
-.dash-table colgroup col:nth-child(2) { width: 22%; }
-.dash-table colgroup col:nth-child(3) { width: 8%; }
-.dash-table colgroup col:nth-child(4) { width: 13%; }
-.dash-table colgroup col:nth-child(5) { width: 13%; }
-.dash-table colgroup col:nth-child(6) { width: 12%; }
-.dash-table colgroup col:nth-child(7) { width: 14%; }
-.dash-table colgroup col:nth-child(8) { width: 13%; }
+.dash-table colgroup col:nth-child(1)  { width: 3%; }
+.dash-table colgroup col:nth-child(2)  { width: 14%; }
+.dash-table colgroup col:nth-child(3)  { width: 7%; }
+.dash-table colgroup col:nth-child(4)  { width: 7%; }
+.dash-table colgroup col:nth-child(5)  { width: 7%; }
+.dash-table colgroup col:nth-child(6)  { width: 6%; }
+.dash-table colgroup col:nth-child(7)  { width: 8%; }
+.dash-table colgroup col:nth-child(8)  { width: 8%; }
+.dash-table colgroup col:nth-child(9)  { width: 8%; }
+.dash-table colgroup col:nth-child(10) { width: 8%; }
+.dash-table colgroup col:nth-child(11) { width: 8%; }
+.dash-table colgroup col:nth-child(12) { width: 6%; }
 
 .dash-table th {
     text-align: right;
@@ -531,19 +575,58 @@ def pill(open_qty: float) -> str:
     return '<span class="pill-F">Flat</span>'
 
 
+def neutral_td(v: Optional[float], show_sign: bool = False, fmt: str = "inr") -> str:
+    """Neutral grey cell — no green/red coloring."""
+    if v is None:
+        return '<td class="zer">—</td>'
+    if fmt == "inr":
+        s = fmt_inr(v, show_sign=show_sign)
+    else:
+        s = str(v)
+    return f'<td style="color:#7a8294">{s}</td>'
+
+
+def pct_td(v: Optional[float]) -> str:
+    """PnL% cell with green/red coloring."""
+    if v is None:
+        return '<td class="zer">—</td>'
+    cls = "pos" if v > 0 else ("neg" if v < 0 else "zer")
+    sign = "+" if v > 0 else ""
+    return f'<td class="{cls}">{sign}{v:.2f}%</td>'
+
+
 def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: set = None) -> str:
     if expanded_syms is None: expanded_syms = set()
     """Build full table HTML from dataframe."""
     html = """
     <table class="dash-table">
+    <colgroup>
+      <col style="width:3%">
+      <col style="width:14%">
+      <col style="width:7%">
+      <col style="width:7%">
+      <col style="width:7%">
+      <col style="width:6%">
+      <col style="width:8%">
+      <col style="width:8%">
+      <col style="width:8%">
+      <col style="width:8%">
+      <col style="width:8%">
+      <col style="width:6%">
+    </colgroup>
     <thead><tr>
-      <th class="left" style="width:28%">Symbol / Expiry</th>
-      <th style="width:8%">Lots</th>
-      <th style="width:13%">Net Exp.</th>
-      <th style="width:13%">Traded Val</th>
-      <th style="width:12%">Carry PnL</th>
-      <th style="width:13%">Day PnL</th>
-      <th style="width:13%">Net PnL</th>
+      <th class="left"></th>
+      <th class="left">Symbol / Expiry</th>
+      <th>LTP</th>
+      <th>Buy Avg</th>
+      <th>Sell Avg</th>
+      <th>Lots</th>
+      <th>Net Exp.</th>
+      <th>Traded Val</th>
+      <th>Carry PnL</th>
+      <th>Day PnL</th>
+      <th>Net PnL</th>
+      <th>PnL%</th>
     </tr></thead>
     <tbody>
     """
@@ -552,47 +635,75 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
         if row["is_stock"]:
             sym      = row["label"]
             lot_size = int(row.get("lot_size", 1))
-            lots_v   = row["lots"]
+
+            # Lots — neutral grey
+            lots_v = row["lots"]
             if lots_v is None:
                 lots_td = '<td class="zer">—</td>'
             else:
                 r   = round(float(lots_v), 1)
-                cls = "pos" if r > 0 else ("neg" if r < 0 else "zer")
                 val = f"+{r}" if r > 0 else str(r)
-                lots_td = f'<td class="{cls}">{val}</td>'
+                lots_td = f'<td style="color:#7a8294">{val}</td>'
+
+            # Stock PnL% = day_pnl / traded_val * 100
+            tval = row.get("traded_val", 0)
+            day  = row.get("day", 0)
+            if tval and tval != 0:
+                stock_pct = (day / abs(tval)) * 100
+            else:
+                stock_pct = None
+
             html += f"""
             <tr class="stock">
+              <td class="btn-cell"></td>
               <td class="left">{sym} <span style="font-size:9px;color:#565c6e;margin-left:4px;font-weight:400">lot {lot_size:,}</span></td>
+              <td class="zer">—</td>
+              <td class="zer">—</td>
+              <td class="zer">—</td>
               {lots_td}
-              {pnl_td(row["net_exp"],    show_sign=False)}
-              {pnl_td(row["traded_val"], show_sign=False)}
+              {neutral_td(row["net_exp"])}
+              {neutral_td(row["traded_val"])}
               {pnl_td(row["carry"])}
               {pnl_td(row["day"])}
               {pnl_td(row["net"])}
+              {pct_td(stock_pct)}
             </tr>"""
         else:
             sym_of_row = row.get("sym", "")
             if not expand_all and sym_of_row not in expanded_syms:
                 continue
-            ltp_str = f"{row['ltp']:,.2f}" if row["ltp"] else ""
-            lots_v  = row["lots"]
+
+            ltp      = row.get("ltp", 0)
+            b_avg    = row.get("buy_avg", 0)
+            s_avg    = row.get("sell_avg", 0)
+            pnl_pct  = row.get("pnl_pct", None)
+
+            ltp_str  = f"{ltp:,.2f}"   if ltp   else "—"
+            b_str    = f"{b_avg:,.2f}" if b_avg  else "—"
+            s_str    = f"{s_avg:,.2f}" if s_avg  else "—"
+
+            # Lots — neutral grey
+            lots_v = row["lots"]
             if lots_v is None:
                 lots_html = '<td class="zer">—</td>'
             else:
-                cls = "pos" if lots_v > 0 else ("neg" if lots_v < 0 else "zer")
-                lots_html = f'<td class="{cls}">{fmt_lots(lots_v)}</td>'
+                val = fmt_lots(lots_v)
+                lots_html = f'<td style="color:#7a8294">{val}</td>'
 
             html += f"""
             <tr class="expiry">
-              <td class="left">{row["label"]}
-                <span class="ltp-lbl">LTP {ltp_str}</span>
-              </td>
+              <td></td>
+              <td class="left">{row["label"]}</td>
+              <td style="color:#c0c6d4;text-align:right;padding-right:12px">{ltp_str}</td>
+              <td style="color:#7a8294;text-align:right;padding-right:12px">{b_str}</td>
+              <td style="color:#7a8294;text-align:right;padding-right:12px">{s_str}</td>
               {lots_html}
-              {pnl_td(row["net_exp"],    show_sign=False)}
-              {pnl_td(row["traded_val"], show_sign=False)}
+              {neutral_td(row["net_exp"])}
+              {neutral_td(row["traded_val"])}
               {pnl_td(row["carry"])}
               {pnl_td(row["day"])}
               {pnl_td(row["net"])}
+              {pct_td(pnl_pct)}
             </tr>"""
 
     html += "</tbody></table>"
@@ -616,14 +727,23 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
     """
     COLS = """
     <colgroup>
+      <col style="width:3%">
+      <col style="width:9%">
+      <col style="width:4%">
       <col style="width:5%">
-      <col style="width:22%">
-      <col style="width:8%">
-      <col style="width:13%">
-      <col style="width:13%">
-      <col style="width:12%">
-      <col style="width:14%">
-      <col style="width:13%">
+      <col style="width:5%">
+      <col style="width:5%">
+      <col style="width:4%">
+      <col style="width:5%">
+      <col style="width:4%">
+      <col style="width:5%">
+      <col style="width:6%">
+      <col style="width:5%">
+      <col style="width:4%">
+      <col style="width:6%">
+      <col style="width:6%">
+      <col style="width:6%">
+      <col style="width:4%">
     </colgroup>"""
 
     html = f"""
@@ -632,12 +752,21 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
     <thead><tr>
       <th class="left"></th>
       <th class="left">Symbol / Expiry</th>
+      <th>Token</th>
+      <th>LTP</th>
+      <th>Buy Avg</th>
+      <th>Sell Avg</th>
+      <th>Carry Lots</th>
       <th>Lots</th>
-      <th>Net Exp.</th>
-      <th>Traded Val</th>
+      <th>Carry Exp.(Cr)</th>
+      <th>Net Exp.(Cr)</th>
+      <th>Traded Val(Cr)</th>
+      <th>Cost</th>
+      <th>Cost%(Bips)</th>
       <th>Carry PnL</th>
       <th>Day PnL</th>
       <th>Net PnL</th>
+      <th>PnL%</th>
     </tr></thead>
     <tbody>
     """
@@ -656,17 +785,56 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         s_day      = sum(x["day"]        for x in exp_calcs)
         s_net      = sum(x["net"]        for x in exp_calcs)
 
-        # lots cell for stock row
+        # Stock lots — neutral grey
         if stock_lots is None:
             lots_td = '<td class="zer">—</td>'
         else:
             r2  = round(float(stock_lots), 1)
-            cls = "pos" if r2 > 0 else ("neg" if r2 < 0 else "zer")
             val = f"+{r2}" if r2 > 0 else str(r2)
-            lots_td = f'<td class="{cls}">{val}</td>'
+            lots_td = f'<td style="color:#7a8294">{val}</td>'
+
+        # Stock PnL% = day_pnl / traded_val * 100
+        if s_tval and s_tval != 0:
+            stock_pct = (s_day / abs(s_tval)) * 100
+            pct_cls   = "pos" if stock_pct > 0 else ("neg" if stock_pct < 0 else "zer")
+            pct_sign  = "+" if stock_pct > 0 else ""
+            stock_pct_td = f'<td class="{pct_cls}">{pct_sign}{stock_pct:.2f}%</td>'
+        else:
+            stock_pct_td = '<td class="zer">—</td>'
+
+        # Latest expiry token — sort expiries by label to get latest
+        latest_token = ""
+        latest_ltp   = ""
+        latest_b_avg = ""
+        latest_s_avg = ""
+        if item["expiries"]:
+            latest_exp   = sorted(item["expiries"], key=lambda x: x["label"])[-1]
+            latest_token = latest_exp.get("token", "")
+            # Get latest expiry calc
+            latest_ec    = next((ec for ec in exp_calcs if ec["label"] == latest_exp["label"]), None)
+            if latest_ec:
+                latest_ltp   = f"{latest_ec['ltp']:,.2f}"   if latest_ec.get("ltp")      else "—"
+                latest_b_avg = f"{latest_ec['buy_avg']:,.2f}" if latest_ec.get("buy_avg") else "—"
+                latest_s_avg = f"{latest_ec['sell_avg']:,.2f}" if latest_ec.get("sell_avg") else "—"
+
+        # Carry Lots aggregate
+        s_carry_lots   = sum(x["carry_lots"]   for x in exp_calcs)
+        s_carry_exp_cr = sum(x["carry_exp_cr"] for x in exp_calcs)
+
+        # Carry Lots td
+        cl = round(float(s_carry_lots), 1)
+        carry_lots_td = f'<td style="color:#7a8294">{("+" if cl > 0 else "") + str(cl)}</td>' if cl != 0 else '<td class="zer">0.0</td>'
+
+        # Net Exp in Cr
+        net_exp_cr = s_net_exp / 1e7
+        net_exp_cr_str = f"{net_exp_cr:+.2f}" if net_exp_cr != 0 else "0"
+
+        # Cost Bips = cost_pct × 100
+        s_cost     = sum(x["cost"]     for x in exp_calcs)
+        s_cost_pct = sum(x["cost_pct"] for x in exp_calcs if x["traded_val"])
+        cost_bips  = round(s_cost_pct * 100, 2) if s_tval else None
 
         arrow = "▾" if is_open else "▸"
-        # toggle via query param
         toggle_href = f"?tog={sym}"
 
         html += f"""
@@ -680,41 +848,219 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
             <span class="sym-name">{sym}</span>
             <span class="lot-badge">lot {lot_size:,}</span>
           </td>
+          <td style="color:#565c6e;text-align:right;padding-right:8px;font-size:11px">{latest_token}</td>
+          <td style="color:#c0c6d4;text-align:right;padding-right:12px">{latest_ltp}</td>
+          <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_b_avg}</td>
+          <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_s_avg}</td>
+          {carry_lots_td}
           {lots_td}
-          {pnl_td(s_net_exp,  show_sign=False)}
-          {pnl_td(s_tval,     show_sign=False)}
+          <td style="color:#7a8294;text-align:right;padding-right:12px">{s_carry_exp_cr:+.2f}</td>
+          <td style="color:#7a8294;text-align:right;padding-right:12px">{net_exp_cr_str}</td>
+          <td style="color:#7a8294;text-align:right;padding-right:12px">{s_tval/1e7:+.2f}</td>
+          <td style="color:#7a8294;text-align:right;padding-right:12px">{fmt_inr(s_cost)}</td>
+          <td style="color:#7a8294;text-align:right;padding-right:12px;font-size:10px">{f"{cost_bips:.2f}" if cost_bips is not None else "—"}</td>
           {pnl_td(s_carry)}
           {pnl_td(s_day)}
           {pnl_td(s_net)}
+          {stock_pct_td}
         </tr>"""
 
         if is_open:
             for ec in exp_calcs:
-                ltp_str = f"{ec['ltp']:,.2f}" if ec.get("ltp") else ""
+                ltp   = ec.get("ltp",      0)
+                b_avg = ec.get("buy_avg",  0)
+                s_avg = ec.get("sell_avg", 0)
+                pnl_pct = ec.get("pnl_pct", None)
+
+                ltp_str = f"{ltp:,.2f}"   if ltp   else "—"
+                b_str   = f"{b_avg:,.2f}" if b_avg  else "—"
+                s_str   = f"{s_avg:,.2f}" if s_avg  else "—"
+
+                # Lots — neutral grey
                 lv = ec["lots"]
                 if lv is None:
                     lh = '<td class="zer">—</td>'
                 else:
-                    cls = "pos" if lv > 0 else ("neg" if lv < 0 else "zer")
-                    lh = f'<td class="{cls}">{fmt_lots(lv)}</td>'
+                    lh = f'<td style="color:#7a8294">{fmt_lots(lv)}</td>'
+
+                # PnL%
+                if pnl_pct is not None:
+                    pct_cls  = "pos" if pnl_pct > 0 else ("neg" if pnl_pct < 0 else "zer")
+                    pct_sign = "+" if pnl_pct > 0 else ""
+                    pnl_pct_td = f'<td class="{pct_cls}">{pct_sign}{pnl_pct:.2f}%</td>'
+                else:
+                    pnl_pct_td = '<td class="zer">—</td>'
+
+                # Carry Lots
+                ecl = round(float(ec["carry_lots"]), 1)
+                carry_lots_td_exp = f'<td style="color:#7a8294">{("+" if ecl > 0 else "") + str(ecl)}</td>' if ecl != 0 else '<td class="zer">0.0</td>'
+
+                # Net Exp in Cr
+                ec_net_exp_cr = ec["net_exp"] / 1e7
+                ec_net_exp_cr_str = f"{ec_net_exp_cr:+.2f}" if ec_net_exp_cr != 0 else "0"
+
+                # Carry Exp in Cr
+                ec_carry_exp_cr = ec["carry_exp_cr"]
+
+                # Cost Bips
+                ec_cost_bips = round(ec["cost_pct"] * 100, 2) if ec["traded_val"] else None
 
                 html += f"""
                 <tr class="expiry">
                   <td></td>
                   <td class="left">
                     <span class="exp-label">{ec["label"]}</span>
-                    <span class="ltp-lbl">LTP {ltp_str}</span>
                   </td>
+                  <td class="zer">—</td>
+                  <td style="color:#c0c6d4;text-align:right;padding-right:12px">{ltp_str}</td>
+                  <td style="color:#7a8294;text-align:right;padding-right:12px">{b_str}</td>
+                  <td style="color:#7a8294;text-align:right;padding-right:12px">{s_str}</td>
+                  {carry_lots_td_exp}
                   {lh}
-                  {pnl_td(ec["net_exp"],    show_sign=False)}
-                  {pnl_td(ec["traded_val"], show_sign=False)}
+                  <td style="color:#7a8294;text-align:right;padding-right:12px">{ec_carry_exp_cr:+.2f}</td>
+                  <td style="color:#7a8294;text-align:right;padding-right:12px">{ec_net_exp_cr_str}</td>
+                  <td style="color:#7a8294;text-align:right;padding-right:12px">{ec["traded_val"]/1e7:+.2f}</td>
+                  <td style="color:#7a8294;text-align:right;padding-right:12px">{fmt_inr(ec["cost"])}</td>
+                  <td style="color:#7a8294;text-align:right;padding-right:12px;font-size:10px">{f"{ec_cost_bips:.2f}" if ec_cost_bips is not None else "—"}</td>
                   {pnl_td(ec["carry"])}
                   {pnl_td(ec["day"])}
                   {pnl_td(ec["net"])}
+                  {pnl_pct_td}
                 </tr>"""
 
     html += "</tbody></table>"
     return html
+
+
+# ============================================================
+# SNAPSHOT — save current dashboard data to dated CSV on colo
+# ============================================================
+
+def _calc_pnl_snap(e: dict, lot_size: int) -> dict:
+    """PnL engine — one row per expiry, mirrors worker logic."""
+    qty_buy  = e["qty_today_buy"]
+    qty_sell = e["qty_today_sell"]
+    qty_on   = e["qty_overnight"]
+    ltp      = e["ltp"]
+    b_avg    = e["buy_avg"]
+    s_avg    = e["sell_avg"]
+
+    open_qty  = qty_on + (qty_buy - qty_sell)
+    lots      = round(open_qty / lot_size, 2) if lot_size > 0 else None
+    carry     = qty_on * (ltp - e["prev_close"])
+    day       = (qty_buy  * (ltp - b_avg)  if qty_buy  > 0 else 0.0) + \
+                (qty_sell * (s_avg - ltp)  if qty_sell > 0 else 0.0)
+    tval      = (qty_buy  * (b_avg  or ltp)) + (qty_sell * (s_avg or ltp))
+    expenses  = (tval / 1e7) * EXPENSE_PER_CR
+    net       = carry + day - expenses
+
+    return {
+        "open_qty":   open_qty,
+        "lots":       lots,
+        "net_exp":    round(open_qty * ltp, 2),
+        "traded_val": round(tval,           2),
+        "carry_pnl":  round(carry,          2),
+        "day_pnl":    round(day,            2),
+        "expenses":   round(expenses,       2),
+        "net_pnl":    round(net,            2),
+    }
+
+
+def build_snapshot_csv(data: list[dict], as_of: str, log_date: str) -> bytes:
+    """Return UTF-8 CSV bytes for the current dashboard data."""
+    buf = io.StringIO()
+    fieldnames = [
+        "snapshot_time", "trade_date", "sym", "lot_size",
+        "expiry_label", "ltp", "qty_overnight", "prev_close",
+        "qty_today_buy", "buy_avg", "qty_today_sell", "sell_avg",
+        "open_qty", "lots", "net_exp", "traded_val",
+        "carry_pnl", "day_pnl", "expenses", "net_pnl", "stock_net_pnl",
+    ]
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+
+    for stock in data:
+        sym      = stock["sym"]
+        lot_size = stock["lot_size"]
+        pnls     = [_calc_pnl_snap(e, lot_size) for e in stock["expiries"]]
+        stock_net = round(sum(p["net_pnl"] for p in pnls), 2)
+
+        for e, p in zip(stock["expiries"], pnls):
+            writer.writerow({
+                "snapshot_time":  as_of,
+                "trade_date":     log_date,
+                "sym":            sym,
+                "lot_size":       lot_size,
+                "expiry_label":   e["label"],
+                "ltp":            e["ltp"],
+                "qty_overnight":  e["qty_overnight"],
+                "prev_close":     e["prev_close"],
+                "qty_today_buy":  e["qty_today_buy"],
+                "buy_avg":        round(e["buy_avg"],  4),
+                "qty_today_sell": e["qty_today_sell"],
+                "sell_avg":       round(e["sell_avg"], 4),
+                "open_qty":       p["open_qty"],
+                "lots":           p["lots"],
+                "net_exp":        p["net_exp"],
+                "traded_val":     p["traded_val"],
+                "carry_pnl":      p["carry_pnl"],
+                "day_pnl":        p["day_pnl"],
+                "expenses":       p["expenses"],
+                "net_pnl":        p["net_pnl"],
+                "stock_net_pnl":  stock_net,
+            })
+
+    return buf.getvalue().encode("utf-8")
+
+
+def save_snapshot_now(data: list[dict], log_date: str) -> tuple[bool, str]:
+    """
+    Build CSV and upload to colo server via SFTP.
+    Returns (success: bool, message: str).
+    Filename: dashboard_snapshot_YYYYMMDD.csv
+    """
+    try:
+        import paramiko as _pm
+    except ImportError:
+        return False, "paramiko not installed — run: pip install paramiko"
+
+    as_of = datetime.now().isoformat(timespec="seconds")
+
+    # Normalise date tag → YYYYMMDD
+    try:
+        date_tag = datetime.strptime(log_date, "%Y-%m-%d").strftime("%Y%m%d") \
+                   if "-" in log_date else log_date[:8]
+    except Exception:
+        date_tag = date.today().strftime("%Y%m%d")
+
+    remote_dir  = f"{REMOTE_DASHBOARD_DIR}/{SNAPSHOT_SUBDIR}"
+    remote_path = f"{remote_dir}/dashboard_snapshot_{date_tag}.csv"
+
+    csv_bytes = build_snapshot_csv(data, as_of, log_date)
+    if not csv_bytes:
+        return False, "No data rows — nothing to save."
+
+    try:
+        client = _pm.SSHClient()
+        client.set_missing_host_key_policy(_pm.AutoAddPolicy())
+        client.connect(SSH_HOST, port=SSH_PORT,
+                       username=SSH_USER, password=SSH_PASS, timeout=15)
+
+        # Ensure remote directory exists
+        client.exec_command(f"mkdir -p {remote_dir}")
+        import time as _t; _t.sleep(0.4)
+
+        sftp = client.open_sftp()
+        with sftp.open(remote_path, "wb") as f:
+            f.write(csv_bytes)
+        sftp.close()
+        client.close()
+
+        row_count = csv_bytes.decode().count("\n") - 1   # subtract header
+        return True, f"Saved → {SSH_HOST}:{remote_path}  ({row_count} rows)"
+
+    except Exception as exc:
+        return False, f"SFTP failed: {exc}"
 
 
 def main():
@@ -723,6 +1069,10 @@ def main():
         st.session_state.expand_all = False
     if "expanded_syms" not in st.session_state:
         st.session_state.expanded_syms = set()
+    if "snap_msg" not in st.session_state:
+        st.session_state.snap_msg = ""   # last snapshot status message
+    if "snap_ok" not in st.session_state:
+        st.session_state.snap_ok  = None  # True / False / None
 
     # Auto-refresh every 10 seconds — preserves expand/collapse state
     st_autorefresh(interval=5000, key="dashboard_refresh")
@@ -748,7 +1098,7 @@ def main():
         st.rerun()
 
     # ── Top bar ──────────────────────────────────────────────
-    col_title, col_time, col_btn = st.columns([3, 1, 1])
+    col_title, col_time, col_btn, col_snap = st.columns([3, 1, 1, 1])
 
     with col_title:
         st.html(
@@ -811,6 +1161,22 @@ def main():
             if not st.session_state.expand_all:
                 st.session_state.expanded_syms = set()
             st.rerun()
+
+    with col_snap:
+        if st.button("💾 Snapshot", key="snap_btn", use_container_width=True):
+            log_date = st.session_state.get("log_date", "") or \
+                       date.today().strftime("%Y-%m-%d")
+            with st.spinner("Saving…"):
+                ok, msg = save_snapshot_now(data, log_date)
+            st.session_state.snap_ok  = ok
+            st.session_state.snap_msg = msg
+
+    # ── Snapshot status message (shown below top bar) ────────
+    if st.session_state.snap_msg:
+        if st.session_state.snap_ok:
+            st.success(f"✅ {st.session_state.snap_msg}", icon=None)
+        else:
+            st.error(f"❌ {st.session_state.snap_msg}", icon=None)
 
     # ── KPI strip ────────────────────────────────────────────
     k1, k2, k3, k4, k5 = st.columns(5)
