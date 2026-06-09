@@ -23,6 +23,7 @@ import io
 import csv
 import time
 import math
+import html as _html
 from datetime import datetime, date
 from typing import Optional
 
@@ -248,6 +249,7 @@ def load_data_from_redis() -> list[dict]:
         # Only mark as LIVE if positions are actually non-empty
         st.session_state["data_source"] = payload.get("source", "redis") if positions else "dummy"
         st.session_state["log_date"]    = payload.get("log_date", "")
+        st.session_state["eod_date"]    = payload.get("eod_date", "")
         return positions
     except Exception:
         return []
@@ -388,7 +390,7 @@ def fetch_median_slippage_bps():
                     try:
                         slip = float(row.get("slip_bps",   ""))
                         tval = float(row.get("traded_val", ""))
-                        if tval > 0:
+                        if tval > 0 and abs(slip) <= 500:
                             total_sv += slip * tval
                             total_v  += tval
                     except: continue
@@ -402,8 +404,8 @@ def fetch_median_slippage_bps():
 @st.cache_data(ttl=60)
 def fetch_avg_t1_minutes():
     """
-    Avg T1 = mean(fill_time - window_start) in minutes across all fills.
-    Uses window_start and time_ist columns from slippage log CSV.
+    Avg T1 = mean(fill_time - window_slot) in seconds (excludes outliers > 60s).
+    window_slot = HHMM when order was sent. Outliers are slow limit orders.
     """
     try:
         import paramiko
@@ -418,18 +420,23 @@ def fetch_avg_t1_minutes():
         try:
             with sftp.open(remote_path, "r") as f:
                 reader = _csv.DictReader(f.read().decode("utf-8").splitlines())
-                t1_list = []
+                t1_all  = []
+                t1_fast = []
                 for row in reader:
                     try:
-                        fill_t = dt.strptime(row["time_ist"].strip(),    "%H:%M:%S")
-                        win_t  = dt.strptime(row["window_start"].strip(), "%H:%M:%S")
-                        t1_sec = (fill_t - win_t).total_seconds()
-                        if t1_sec >= 0:
-                            t1_list.append(t1_sec / 60.0)
+                        fill_t = dt.strptime(row["time_ist"].strip(), "%H:%M:%S")
+                        slot   = str(row.get("window_slot","")).strip().zfill(4)
+                        slot_t = dt.strptime(f"{slot[:2]}:{slot[2:]}", "%H:%M")
+                        t1_sec = (fill_t - slot_t).total_seconds()
+                        if 0 <= t1_sec <= 600:
+                            t1_all.append(t1_sec)
+                            if t1_sec <= 60:
+                                t1_fast.append(t1_sec)
                     except: continue
         finally:
             sftp.close(); client.close()
-        return sum(t1_list) / len(t1_list) if t1_list else None
+        t1_use = t1_fast if t1_fast else t1_all
+        return (sum(t1_use) / len(t1_use)) / 60.0 if t1_use else None
     except Exception:
         return None
 
@@ -448,8 +455,33 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     open_qty   = e["qty_overnight"] + net_today
     lots       = open_qty / lot_size if lot_size > 0 else None
 
-    # Carry PnL: prev EOD position marked to today's LTP
-    carry = e["qty_overnight"] * (e["ltp"] - e["prev_close"])
+    # ── Carry PnL logic ──────────────────────────────────────────────────────
+    # Split into two parts:
+    #   carry_locked : PnL earned up to & including previous day's close.
+    #                  Frozen value from yesterday's EOD snapshot CSV.
+    #                  Shows 0 if no snapshot available (first day / new position).
+    #   carry_today  : Today's live carry = qty_overnight * (ltp - prev_close).
+    #                  = 0 pre-market (ltp == 0), then floats with LTP once market opens.
+    #
+    # The "carry" field shown in the dashboard column is carry_today only —
+    # reflecting today's movement from yesterday's close.  carry_locked is
+    # preserved separately and shown as the previous day's dated carry row.
+    carry_locked = e.get("carry_pnl_locked") or 0.0   # None → 0
+
+    # ── Time gate: carry PnL only live from 9:10 AM IST ──────────────────────
+    # Before 9:10 → pre-open indicative prices are unreliable, show 0.
+    # From 9:10  → pre-open matching is done, LTP is stable enough to use.
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    _now        = _dt.now(tz=_ZI("Asia/Kolkata"))
+    _market_gate = _now.replace(hour=9, minute=10, second=0, microsecond=0)
+    _market_open = _now < _market_gate
+
+    if _market_open:
+        carry        = 0.0
+        carry_locked = 0.0   # also hide yesterday locked carry before 9:10
+    else:
+        carry = e["qty_overnight"] * (e["ltp"] - e["prev_close"])
 
     # Day PnL: split into REALIZED (squared) + UNREALIZED (open leg)
     # Case 1: pure intraday — match buy vs sell
@@ -530,6 +562,8 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     return {
         "label":        e["label"],
         "token":        e.get("token", ""),
+        "prev_close":   e.get("prev_close", 0.0),
+        "qty_overnight": e.get("qty_overnight", 0.0),
         "ltp":          e["ltp"],
         "buy_avg":      e.get("buy_avg",  0.0),
         "sell_avg":     e.get("sell_avg", 0.0),
@@ -541,16 +575,97 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
         "traded_val":   traded_val,
         "cost":         expenses,
         "cost_pct":     round((expenses / traded_val * 100), 4) if traded_val else 0.0,
-        "carry":        carry,
-        "day":          day,
-        "realized":     realized,
-        "unrealized":   unreal_buy + unreal_sell,
-        "net":          net,
-        "pnl_pct":      pnl_pct,
-        "mtd":          e.get("mtd", 0),
-        "slippage":     slippage,
-        "inr_slippage": e.get("inr_slippage", None),
+        "carry":              carry,        # today's carry: 0 pre-market, live once LTP feeds
+        "carry_locked":       carry_locked, # yesterday's carry: frozen at previous close
+        "day":                day,
+        "realized":           realized,
+        "unrealized":         unreal_buy + unreal_sell,
+        "net":                net,
+        "pnl_pct":            pnl_pct,
+        "mtd":                e.get("mtd", 0),
+        "slippage":           slippage,
+        "inr_slippage":       e.get("inr_slippage", None),
+        "inr_slip_traded_val": e.get("inr_slip_traded_val", None),
+        "eod_date":           e.get("eod_date", ""),
     }
+
+
+def fetch_otr_per_symbol(positions: list | None = None) -> dict:
+    """OTR per symbol: orders_sent / fills from today's strategy log."""
+    import re as _re
+    try:
+        import paramiko as _pm
+        from datetime import date as _date
+        trade_date = _date.today().strftime("%Y%m%d")
+        client = _pm.SSHClient()
+        client.set_missing_host_key_policy(_pm.AutoAddPolicy())
+        client.connect("192.168.71.200", port=22, username="Data_colo",
+                       password="Datacolo@2026", timeout=5)
+        _, out, _ = client.exec_command(
+            f"ls /data/logs/*algo_1_{trade_date}.log 2>/dev/null | head -1")
+        log_path = out.read().decode().strip()
+        if not log_path:
+            _, out, _ = client.exec_command(
+                "ls -t /data/logs/*algo_1_*.log 2>/dev/null | head -1")
+            log_path = out.read().decode().strip()
+        if not log_path:
+            client.close(); return {}
+        _, out, _ = client.exec_command(
+            f"grep -E 'send_order::EXECUTION_STRATEGY_LIVE|emit_trade_fill::FTRD' {log_path}")
+        lines = out.read().decode('utf-8', errors='replace').splitlines()
+        client.close()
+
+        # ── Build tok2sym from live positions — always 100% dynamic ──
+        # Primary: positions data has sym + token for every symbol in the book.
+        # No Redis EOD dependency, no hardcoding — new symbols just work.
+        tok2sym = {}
+        if positions:
+            for _stock in positions:
+                _sym = _stock.get("sym", "")
+                for _e in _stock.get("expiries", []):
+                    _tok = str(_e.get("token", "")).strip()
+                    if _tok and _sym:
+                        tok2sym[_tok] = _sym
+        # Fallback: Redis EOD key (only if positions not passed)
+        if not tok2sym:
+            import redis as _rd, json as _json
+            r1 = _rd.Redis(host="localhost", port=6379, db=1, decode_responses=True)
+            from datetime import date as _d2
+            _today = _d2.today().strftime("%Y%m%d")
+            _raw = r1.get(f"dashboard:eod:{_today}")
+            if _raw:
+                for _tok, _v in _json.loads(_raw).items():
+                    _name = _v.get("name", "")
+                    if _tok and _name:
+                        tok2sym[str(int(_tok))] = _name
+
+        orders_ct: dict = {}
+        fills_ct:  dict = {}
+        re_send = _re.compile(r'send order=\[(\d+),')
+        re_ftrd = _re.compile(r'FTRD:[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,(\d+),')
+
+        for line in lines:
+            if 'send_order' in line:
+                m = re_send.search(line)
+                if m:
+                    t = m.group(1)
+                    orders_ct[t] = orders_ct.get(t, 0) + 1
+            elif 'FTRD' in line:
+                m = re_ftrd.search(line)
+                if m:
+                    t = m.group(1)
+                    fills_ct[t] = fills_ct.get(t, 0) + 1
+
+        result = {}
+        for tok in set(list(orders_ct) + list(fills_ct)):
+            sym = tok2sym.get(tok, tok)
+            o   = orders_ct.get(tok, 0)
+            f   = fills_ct.get(tok, 0)
+            if f > 0:
+                result[sym] = {'orders': o, 'fills': f, 'otr': round(o/f, 1)}
+        return result
+    except Exception:
+        return {}
 
 
 def get_signal_map() -> dict[str, dict]:
@@ -615,7 +730,8 @@ def build_table(data: list[dict]) -> tuple[pd.DataFrame, dict]:
     Returns (df, kpis)
     """
     rows = []
-    kpis = {"net_exp": 0.0, "gross_exp": 0.0, "carry": 0.0, "day": 0.0, "net": 0.0, "expenses": 0.0, "slippages": []}
+    kpis = {"net_exp": 0.0, "gross_exp": 0.0, "carry": 0.0, "carry_locked": 0.0,
+             "day": 0.0, "net": 0.0, "expenses": 0.0, "slippages": []}
 
     for st in data:
         sym      = st["sym"]
@@ -625,7 +741,7 @@ def build_table(data: list[dict]) -> tuple[pd.DataFrame, dict]:
         for e in st["expiries"]:
             r = calc_expiry_pnl(e, lot_size)
             exp_rows.append(r)
-            for k in ["net_exp", "carry", "day", "net"]:
+            for k in ["net_exp", "carry", "carry_locked", "day", "net"]:
                 kpis[k] += r[k]
             kpis["expenses"] += r.get("cost", 0.0)
             if r.get("slippage") is not None:
@@ -645,11 +761,12 @@ def build_table(data: list[dict]) -> tuple[pd.DataFrame, dict]:
             "open_qty":   total_open_qty,
             "net_exp":    sum(x["net_exp"]     for x in exp_rows),
             "traded_val": sum(x["traded_val"]  for x in exp_rows),
-            "carry":      sum(x["carry"]       for x in exp_rows),
-            "day":        sum(x["day"]         for x in exp_rows),
-            "net":        sum(x["net"]         for x in exp_rows),
-            "mtd":        sum(x["mtd"]         for x in exp_rows),
-            "ltp":        None,
+            "carry":        sum(x["carry"]        for x in exp_rows),
+            "carry_locked": sum(x["carry_locked"]  for x in exp_rows),
+            "day":          sum(x["day"]           for x in exp_rows),
+            "net":          sum(x["net"]           for x in exp_rows),
+            "mtd":          sum(x["mtd"]           for x in exp_rows),
+            "ltp":          None,
         }
         rows.append(agg)
 
@@ -794,6 +911,23 @@ st.html("""
     margin-left: 6px; font-weight: 400;
 }
 
+/* column filters */
+.col-filter {
+    width: 94%;
+    box-sizing: border-box;
+    background: #151821;
+    border: 1px solid #252936;
+    border-radius: 3px;
+    color: #c0c6d4;
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 9px;
+    padding: 3px 4px;
+    outline: none;
+}
+.col-filter::placeholder { color: #3f4658; }
+.col-filter:focus { border-color: #3a4055; }
+.filter-th { padding: 3px 2px 5px 2px !important; }
+
 /* section header */
 .section-hdr {
     font-family: 'IBM Plex Sans', sans-serif;
@@ -899,6 +1033,35 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
       <th>PnL%</th>
       <th>Slippage (bp)</th>
       <th>INR Slip (bp)</th>
+      <th style="color:#565c6e">Last Fill</th>
+    </tr>
+    <tr>
+      <th class="filter-th"></th>
+      <th class="filter-th left">{_filter_input("sym", "symbol")}</th>
+      <th class="filter-th">{_filter_input("token", "token")}</th>
+      <th class="filter-th">{_filter_input("real", "real")}</th>
+      <th class="filter-th">{_filter_input("final", "final")}</th>
+      <th class="filter-th">{_filter_input("ltp", "ltp")}</th>
+      <th class="filter-th">{_filter_input("buy", "buy")}</th>
+      <th class="filter-th">{_filter_input("sell", "sell")}</th>
+      <th class="filter-th">{_filter_input("carrylots", "carry lots")}</th>
+      <th class="filter-th">{_filter_input("carryavg", "carry avg")}</th>
+      <th class="filter-th">{_filter_input("lots", "lots")}</th>
+      <th class="filter-th"></th>
+      <th class="filter-th">{_filter_input("carryexp", "carry exp")}</th>
+      <th class="filter-th">{_filter_input("netexp", "net exp")}</th>
+      <th class="filter-th">{_filter_input("tv", "traded")}</th>
+      <th class="filter-th">{_filter_input("cost", "cost")}</th>
+      <th class="filter-th">{_filter_input("costbps", "bps")}</th>
+      <th class="filter-th">{_filter_input("carry", "carry pnl")}</th>
+      <th class="filter-th">{_filter_input("realized", "realized")}</th>
+      <th class="filter-th">{_filter_input("unrealized", "unreal")}</th>
+      <th class="filter-th">{_filter_input("day", "day pnl")}</th>
+      <th class="filter-th">{_filter_input("net", "net pnl")}</th>
+      <th class="filter-th">{_filter_input("pnlpct", "%")}</th>
+      <th class="filter-th">{_filter_input("slip", "slip")}</th>
+      <th class="filter-th">{_filter_input("inrslip", "inr")}</th>
+      <th class="filter-th">{_filter_input("lastfill", "fill")}</th>
     </tr></thead>
     <tbody>
     """
@@ -935,7 +1098,7 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
               {lots_td}
               {neutral_td(row["net_exp"])}
               {neutral_td(row["traded_val"])}
-              {pnl_td(row["carry"])}
+              {pnl_td(row["carry"] + row.get("carry_locked", 0))}
               {pnl_td(row["day"])}
               {pnl_td(row["net"])}
               {pct_td(stock_pct)}
@@ -972,7 +1135,7 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
               {lots_html}
               {neutral_td(row["net_exp"])}
               {neutral_td(row["traded_val"])}
-              {pnl_td(row["carry"])}
+              {pnl_td(row["carry"] + row.get("carry_locked", 0))}
               {pnl_td(row["day"])}
               {pnl_td(row["net"])}
               {pct_td(pnl_pct)}
@@ -986,7 +1149,7 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
 # MAIN APP
 # ============================================================
 
-def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms: set) -> str:
+def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms: set, filters: dict | None = None) -> str:
     """
     Render the entire position book as ONE unified <table> so every
     column is pixel-perfect aligned regardless of row type.
@@ -1002,12 +1165,15 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <col style="width:22px">   <!-- toggle btn -->
       <col style="width:130px">  <!-- Symbol / Expiry -->
       <col style="width:55px">   <!-- Token -->
+      <col style="width:75px">   <!-- Net PnL -->
+      <col style="width:65px">   <!-- Last Fill -->
       <col style="width:45px">   <!-- Real Sig -->
       <col style="width:45px">   <!-- Final Sig -->
       <col style="width:75px">   <!-- LTP -->
       <col style="width:80px">   <!-- Buy Avg -->
       <col style="width:80px">   <!-- Sell Avg -->
       <col style="width:55px">   <!-- Carry Lots -->
+      <col style="width:70px">   <!-- Carry Avg -->
       <col style="width:55px">   <!-- Lots -->
       <col style="width:20px">   <!-- mismatch -->
       <col style="width:70px">   <!-- Carry Exp.(Cr) -->
@@ -1019,40 +1185,82 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <col style="width:80px">   <!-- Realized -->
       <col style="width:80px">   <!-- Unrealized -->
       <col style="width:75px">   <!-- Day PnL -->
-      <col style="width:75px">   <!-- Net PnL -->
       <col style="width:55px">   <!-- PnL% -->
       <col style="width:75px">   <!-- Slippage -->
       <col style="width:75px">   <!-- INR Slip -->
     </colgroup>"""
 
+    filters = filters or {}
+    def _fv(key: str) -> str:
+        return _html.escape(str(filters.get(key, "") or ""), quote=True)
+    def _filter_input(key: str, placeholder: str = "filter") -> str:
+        return (
+            f'<input class="col-filter" form="pos-filter-form" name="f_{key}" '
+            f'value="{_fv(key)}" placeholder="{placeholder}" title="Press Enter to apply" />'
+        )
+
     html = f"""
+    <form id="pos-filter-form" method="get">
+      <input type="hidden" name="sort" value="__ACTIVE_SORT__">
+      <input type="hidden" name="asc" value="__ACTIVE_ASC__">
+    </form>
     <table class="dash-table">
     {COLS}
     <thead><tr>
       <th class="left"></th>
-      <th class="left">Symbol / Expiry</th>
+      <th class="left" style="cursor:pointer"><a href="__HREF_sym__" style="text-decoration:none;color:inherit">Symbol / Expiry <span style="color:__SC_sym__;font-size:11px;font-weight:bold">__SA_sym__</span></a></th>
       <th>Token</th>
+      <th style="cursor:pointer"><a href="__HREF_net__" style="text-decoration:none;color:inherit">Net PnL <span style="color:__SC_net__;font-size:11px;font-weight:bold">__SA_net__</span></a></th>
+      <th style="color:#565c6e">Last Fill</th>
       <th>Real Sig</th>
       <th>Final Sig</th>
-      <th>LTP</th>
+      <th style="cursor:pointer"><a href="__HREF_ltp__" style="text-decoration:none;color:inherit">LTP <span style="color:__SC_ltp__;font-size:11px;font-weight:bold">__SA_ltp__</span></a></th>
       <th>Buy Avg</th>
       <th>Sell Avg</th>
       <th>Carry Lots</th>
-      <th>Lots</th>
+      <th style="color:#565c6e">Carry Avg</th>
+      <th style="cursor:pointer"><a href="__HREF_lots__" style="text-decoration:none;color:inherit">Lots <span style="color:__SC_lots__;font-size:11px;font-weight:bold">__SA_lots__</span></a></th>
       <th title="Signal/Lots mismatch">⚡</th>
       <th>Carry Exp.(Cr)</th>
-      <th>Net Exp.(Cr)</th>
-      <th>Traded Val(Cr)</th>
+      <th style="cursor:pointer"><a href="__HREF_netexp__" style="text-decoration:none;color:inherit">Net Exp.(Cr) <span style="color:__SC_netexp__;font-size:11px;font-weight:bold">__SA_netexp__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_tv__" style="text-decoration:none;color:inherit">Traded Val(Cr) <span style="color:__SC_tv__;font-size:11px;font-weight:bold">__SA_tv__</span></a></th>
       <th>Cost</th>
       <th>Cost%(Bips)</th>
-      <th>Carry PnL</th>
-      <th style="color:#2eca8a">Realized</th>
-      <th style="color:#e8a825">Unrealized</th>
-      <th>Day PnL</th>
-      <th>Net PnL</th>
+      <th style="cursor:pointer"><a href="__HREF_carry__" style="text-decoration:none;color:inherit">Carry PnL <span style="color:__SC_carry__;font-size:11px;font-weight:bold">__SA_carry__</span></a></th>
+      <th style="color:#2eca8a;cursor:pointer"><a href="__HREF_real__" style="text-decoration:none;color:inherit">Realized <span style="color:__SC_real__;font-size:11px;font-weight:bold">__SA_real__</span></a></th>
+      <th style="color:#e8a825;cursor:pointer"><a href="__HREF_unreal__" style="text-decoration:none;color:inherit">Unrealized <span style="color:__SC_unreal__;font-size:11px;font-weight:bold">__SA_unreal__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_day__" style="text-decoration:none;color:inherit">Day PnL <span style="color:__SC_day__;font-size:11px;font-weight:bold">__SA_day__</span></a></th>
       <th>PnL%</th>
       <th>Slippage (bp)</th>
       <th>INR Slip (bp)</th>
+    </tr>
+    <tr>
+      <th class="filter-th"></th>
+      <th class="filter-th left">{_filter_input("sym", "symbol")}</th>
+      <th class="filter-th">{_filter_input("token", "token")}</th>
+      <th class="filter-th">{_filter_input("net", "net pnl")}</th>
+      <th class="filter-th">{_filter_input("lastfill", "fill")}</th>
+      <th class="filter-th">{_filter_input("real", "real")}</th>
+      <th class="filter-th">{_filter_input("final", "final")}</th>
+      <th class="filter-th">{_filter_input("ltp", "ltp")}</th>
+      <th class="filter-th">{_filter_input("buy", "buy")}</th>
+      <th class="filter-th">{_filter_input("sell", "sell")}</th>
+      <th class="filter-th">{_filter_input("carrylots", "carry lots")}</th>
+      <th class="filter-th">{_filter_input("carryavg", "carry avg")}</th>
+      <th class="filter-th">{_filter_input("lots", "lots")}</th>
+      <th class="filter-th"></th>
+      <th class="filter-th">{_filter_input("carryexp", "carry exp")}</th>
+      <th class="filter-th">{_filter_input("netexp", "net exp")}</th>
+      <th class="filter-th">{_filter_input("tv", "traded")}</th>
+      <th class="filter-th">{_filter_input("cost", "cost")}</th>
+      <th class="filter-th">{_filter_input("costbps", "bps")}</th>
+      <th class="filter-th">{_filter_input("carry", "carry pnl")}</th>
+      <th class="filter-th">{_filter_input("realized", "realized")}</th>
+      <th class="filter-th">{_filter_input("unrealized", "unreal")}</th>
+      <th class="filter-th">{_filter_input("day", "day pnl")}</th>
+      <th class="filter-th">{_filter_input("pnlpct", "%")}</th>
+      <th class="filter-th">{_filter_input("slip", "slip")}</th>
+      <th class="filter-th">{_filter_input("inrslip", "inr")}</th>
     </tr></thead>
     <tbody>
     """
@@ -1083,9 +1291,12 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
             stock_slip = None
 
         # INR-weighted slippage for stock row
-        _inr_pairs = [(x["inr_slippage"], x["traded_val"])
+        # Weight by inr_slip_traded_val (Σ fill-level traded_val that contributed to
+        # the per-expiry inr_slip computation), NOT by the expiry-level traded_val
+        # (which is recomputed from avg prices and drifts from the fill-level sum).
+        _inr_pairs = [(x["inr_slippage"], x["inr_slip_traded_val"])
                       for x in exp_calcs
-                      if x.get("inr_slippage") is not None and x.get("traded_val", 0) > 0]
+                      if x.get("inr_slippage") is not None and (x.get("inr_slip_traded_val") or 0) > 0]
         if _inr_pairs:
             _inr_w        = sum(w for _, w in _inr_pairs)
             stock_inr_slip = sum(s * w for s, w in _inr_pairs) / _inr_w if _inr_w else None
@@ -1095,7 +1306,8 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         stock_lots = total_oq / lot_size if lot_size > 0 else None
         s_net_exp    = sum(x["net_exp"]    for x in exp_calcs)
         s_tval       = sum(x["traded_val"] for x in exp_calcs)
-        s_carry      = sum(x["carry"]      for x in exp_calcs)
+        s_carry_locked = sum(x.get("carry_locked", 0) for x in exp_calcs)
+        s_carry        = sum(x["carry"]      for x in exp_calcs) + s_carry_locked
         s_day        = sum(x["day"]        for x in exp_calcs)
         s_net        = sum(x["net"]        for x in exp_calcs)
         s_realized   = sum(x.get("realized",   0) for x in exp_calcs)
@@ -1140,6 +1352,17 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         # Carry Lots td
         cl = round(float(s_carry_lots), 1)
         carry_lots_td = f'<td style="color:#7a8294">{("+" if cl > 0 else "") + str(cl)}</td>' if cl != 0 else '<td class="zer">0.0</td>'
+        # Carry Avg = weighted previous close of overnight carry, never today's fill price.
+        _carry_notional = 0.0
+        _carry_qty_abs  = 0.0
+        for _e in item["expiries"]:
+            _q = abs(float(_e.get("qty_overnight", 0.0) or 0.0))
+            _pc = float(_e.get("prev_close", 0.0) or 0.0)
+            if _q > 0 and _pc > 0:
+                _carry_notional += _q * _pc
+                _carry_qty_abs  += _q
+        _carry_prev = (_carry_notional / _carry_qty_abs) if _carry_qty_abs else 0.0
+        carry_avg_td = f'<td style="color:#565c6e;font-size:10px">{f"{_carry_prev:,.2f}" if _carry_prev else "—"}</td>'
 
         # Net Exp in Cr
         net_exp_cr = s_net_exp / 1e7
@@ -1149,6 +1372,13 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         s_cost     = sum(x["cost"]     for x in exp_calcs)
         s_cost_pct = sum(x["cost_pct"] for x in exp_calcs if x["traded_val"])
         cost_bips  = round(s_cost_pct * 100, 2) if s_tval else None
+
+        # Last fill time across all expiries for this stock
+        _stock_last_fill = ""
+        for _e in item["expiries"]:
+            _t = _e.get("last_fill_time", "")
+            if _t and _t > _stock_last_fill:
+                _stock_last_fill = _t
 
         arrow = "▾" if is_open else "▸"
         toggle_href = f"?tog={sym}"
@@ -1165,12 +1395,15 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
             <span class="lot-badge">lot {lot_size:,}</span>
           </td>
           <td style="color:#565c6e;text-align:right;padding-right:8px;font-size:11px">{latest_token}</td>
+          {pnl_td(s_net)}
+          <td style="color:#565c6e;font-size:10px;text-align:right;padding-right:8px">{_stock_last_fill or "—"}</td>
           {signal_td(real_sig)}
           {signal_td(final_sig)}
           <td style="color:#c0c6d4;text-align:right;padding-right:12px">{latest_ltp}</td>
           <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_b_avg}</td>
           <td style="color:#7a8294;text-align:right;padding-right:12px">{latest_s_avg}</td>
           {carry_lots_td}
+          {carry_avg_td}
           {lots_td}
           {mismatch_td(final_sig, stock_lots)}
           <td style="color:#7a8294;text-align:right;padding-right:12px">{s_carry_exp_cr:+.2f}</td>
@@ -1182,7 +1415,6 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
           {pnl_td(s_realized)}
           {pnl_td(s_unrealized)}
           {pnl_td(s_day)}
-          {pnl_td(s_net)}
           {stock_pct_td}
           {slip_td(stock_slip, stock_open_qty)}
           {slip_td(stock_inr_slip, stock_open_qty)}
@@ -1217,6 +1449,8 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                 # Carry Lots
                 ecl = round(float(ec["carry_lots"]), 1)
                 carry_lots_td_exp = f'<td style="color:#7a8294">{("+" if ecl > 0 else "") + str(ecl)}</td>' if ecl != 0 else '<td class="zer">0.0</td>'
+                _ec_prev = ec.get("prev_close", 0.0) or 0.0
+                carry_avg_td_exp = f'<td style="color:#565c6e;font-size:10px">{f"{_ec_prev:,.2f}" if _ec_prev else "—"}</td>'
 
                 # Net Exp in Cr
                 ec_net_exp_cr = ec["net_exp"] / 1e7
@@ -1235,12 +1469,15 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                     <span class="exp-label">{ec["label"]}</span>
                   </td>
                   <td class="zer">—</td>
+                  {pnl_td(ec["net"])}
+                  <td style="color:#565c6e;font-size:10px;text-align:right;padding-right:8px">{ec.get("last_fill_time") or "—"}</td>
                   {signal_td(real_sig)}
                   {signal_td(final_sig)}
                   <td style="color:#c0c6d4;text-align:right;padding-right:12px">{ltp_str}</td>
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{b_str}</td>
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{s_str}</td>
                   {carry_lots_td_exp}
+                  {carry_avg_td_exp}
                   {lh}
                   {mismatch_td(final_sig, ec.get("lots"))}
                   <td style="color:#7a8294;text-align:right;padding-right:12px">{ec_carry_exp_cr:+.2f}</td>
@@ -1252,7 +1489,6 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                   {pnl_td(ec.get("realized", 0))}
                   {pnl_td(ec.get("unrealized", 0))}
                   {pnl_td(ec["day"])}
-                  {pnl_td(ec["net"])}
                   {pnl_pct_td}
                   {slip_td(ec.get("slippage"), ec.get("open_qty", 0))}
                   {slip_td(ec.get("inr_slippage"), ec.get("open_qty", 0))}
@@ -1393,6 +1629,307 @@ def save_snapshot_now(data: list[dict], log_date: str) -> tuple[bool, str]:
         return False, f"SFTP failed: {exc}"
 
 
+
+def _fmt_num_for_grid(v, decimals=2):
+    try:
+        if v is None or (isinstance(v, float) and math.isnan(v)):
+            return None
+        return round(float(v), decimals)
+    except Exception:
+        return None
+
+
+def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, otr_map: dict | None = None) -> pd.DataFrame:
+    """Flat table for AgGrid. AgGrid provides native per-column filters + sorting."""
+    signal_map = get_signal_map()
+    out = []
+    for item in data:
+        sym = item["sym"]
+        lot_size = item["lot_size"]
+        sig = signal_map.get(sym.upper(), {})
+        real_sig = sig.get("real_signal", "—")
+        final_sig = sig.get("final_signal", "—")
+        exp_calcs = [calc_expiry_pnl(e, lot_size) for e in item["expiries"]]
+        s_open_qty = sum(x["open_qty"] for x in exp_calcs)
+        s_tval = sum(x["traded_val"] for x in exp_calcs)
+        s_cost = sum(x["cost"] for x in exp_calcs)
+        s_cost_pct = sum(x["cost_pct"] for x in exp_calcs if x["traded_val"])
+        latest_exp = sorted(item["expiries"], key=lambda x: x["label"])[-1] if item["expiries"] else {}
+        latest_ec = next((ec for ec in exp_calcs if ec["label"] == latest_exp.get("label")), exp_calcs[-1] if exp_calcs else {})
+        _slip_pairs = [(x.get("slippage"), x["traded_val"]) for x in exp_calcs if x.get("slippage") is not None and x.get("traded_val", 0) > 0]
+        stock_slip = None
+        if _slip_pairs:
+            tw = sum(w for _, w in _slip_pairs)
+            stock_slip = sum(s * w for s, w in _slip_pairs) / tw if tw else None
+        _inr_pairs = [(x.get("inr_slippage"), x.get("inr_slip_traded_val")) for x in exp_calcs if x.get("inr_slippage") is not None and (x.get("inr_slip_traded_val") or 0) > 0]
+        stock_inr_slip = None
+        if _inr_pairs:
+            tw = sum(w for _, w in _inr_pairs)
+            stock_inr_slip = sum(s * w for s, w in _inr_pairs) / tw if tw else None
+        s_day = sum(x["day"] for x in exp_calcs)
+        # Carry Avg = weighted previous close of overnight carry, never today's fill price.
+        carry_prev_num = 0.0
+        carry_prev_den = 0.0
+        for _e in item["expiries"]:
+            _q = abs(float(_e.get("qty_overnight", 0.0) or 0.0))
+            _pc = float(_e.get("prev_close", 0.0) or 0.0)
+            if _q > 0 and _pc > 0:
+                carry_prev_num += _q * _pc
+                carry_prev_den += _q
+        carry_avg_prev_close = (carry_prev_num / carry_prev_den) if carry_prev_den else None
+        out.append({
+            "Symbol / Expiry": sym,
+            "Lot Size": lot_size,
+            "Token": latest_exp.get("token", ""),
+            "Net PnL": _fmt_num_for_grid(sum(x["net"] for x in exp_calcs), 0),
+            "Last Fill": max([e.get("last_fill_time", "") for e in item["expiries"]] or [""]),
+            "Real Sig": real_sig,
+            "Final Sig": final_sig,
+            "LTP": _fmt_num_for_grid(latest_ec.get("ltp")),
+            "Buy Avg": _fmt_num_for_grid(latest_ec.get("buy_avg")),
+            "Sell Avg": _fmt_num_for_grid(latest_ec.get("sell_avg")),
+            "Carry Lots": _fmt_num_for_grid(sum(x["carry_lots"] for x in exp_calcs), 1),
+            "Carry Avg": _fmt_num_for_grid(carry_avg_prev_close),
+            "Lots": _fmt_num_for_grid(s_open_qty / lot_size if lot_size else None, 1),
+            "⚡": "●" if mismatch_td(final_sig, s_open_qty / lot_size if lot_size else None) != '<td></td>' else "",
+            "Carry Exp.(Cr)": _fmt_num_for_grid(sum(x["carry_exp_cr"] for x in exp_calcs)),
+            "Net Exp.(Cr)": _fmt_num_for_grid(sum(x["net_exp"] for x in exp_calcs) / 1e7),
+            "Traded Val(Cr)": _fmt_num_for_grid(s_tval / 1e7),
+            "Cost": _fmt_num_for_grid(s_cost, 0),
+            "Cost%(Bips)": _fmt_num_for_grid(s_cost_pct * 100 if s_tval else None),
+            "Carry PnL": _fmt_num_for_grid(sum(x["carry"] + x.get("carry_locked", 0) for x in exp_calcs), 0),
+            "Realized": _fmt_num_for_grid(sum(x.get("realized", 0) for x in exp_calcs), 0),
+            "Unrealized": _fmt_num_for_grid(sum(x.get("unrealized", 0) for x in exp_calcs), 0),
+            "Day PnL": _fmt_num_for_grid(s_day, 0),
+            "PnL%": _fmt_num_for_grid((s_day / abs(s_tval) * 100) if s_tval else None),
+            "Slippage (bp)": _fmt_num_for_grid(stock_slip * 10000 if stock_slip is not None else None),
+            "INR Slip (bp)": _fmt_num_for_grid(stock_inr_slip * 10000 if stock_inr_slip is not None else None),
+            "OTR":       (lambda _o: f'{_o["otr"]}' if _o else "")(
+                         (otr_map or {}).get(item["sym"], {})),
+            "_row_type": "stock",
+        })
+        if expand_all or sym in expanded_syms:
+            for e, ec in zip(item["expiries"], exp_calcs):
+                out.append({
+                    "Symbol / Expiry": "  " + ec["label"],
+                    "Lot Size": lot_size,
+                    "Token": e.get("token", ""),
+                    "Net PnL": _fmt_num_for_grid(ec.get("net"), 0),
+                    "Last Fill": e.get("last_fill_time", ""),
+                    "Real Sig": real_sig,
+                    "Final Sig": final_sig,
+                    "LTP": _fmt_num_for_grid(ec.get("ltp")),
+                    "Buy Avg": _fmt_num_for_grid(ec.get("buy_avg")),
+                    "Sell Avg": _fmt_num_for_grid(ec.get("sell_avg")),
+                    "Carry Lots": _fmt_num_for_grid(ec.get("carry_lots"), 1),
+                    "Carry Avg": _fmt_num_for_grid(e.get("prev_close")),
+                    "Lots": _fmt_num_for_grid(ec.get("lots"), 1),
+                    "⚡": "●" if mismatch_td(final_sig, ec.get("lots")) != '<td></td>' else "",
+                    "Carry Exp.(Cr)": _fmt_num_for_grid(ec.get("carry_exp_cr")),
+                    "Net Exp.(Cr)": _fmt_num_for_grid(ec.get("net_exp") / 1e7),
+                    "Traded Val(Cr)": _fmt_num_for_grid(ec.get("traded_val") / 1e7),
+                    "Cost": _fmt_num_for_grid(ec.get("cost"), 0),
+                    "Cost%(Bips)": _fmt_num_for_grid(ec.get("cost_pct") * 100 if ec.get("traded_val") else None),
+                    "Carry PnL": _fmt_num_for_grid(ec.get("carry"), 0),
+                    "Realized": _fmt_num_for_grid(ec.get("realized"), 0),
+                    "Unrealized": _fmt_num_for_grid(ec.get("unrealized"), 0),
+                    "Day PnL": _fmt_num_for_grid(ec.get("day"), 0),
+                    "PnL%": _fmt_num_for_grid(ec.get("pnl_pct")),
+                    "Slippage (bp)": _fmt_num_for_grid(ec.get("slippage") * 10000 if ec.get("slippage") is not None else None),
+                    "INR Slip (bp)": _fmt_num_for_grid(ec.get("inr_slippage") * 10000 if ec.get("inr_slippage") is not None else None),
+                    "_row_type": "expiry",
+                })
+    return pd.DataFrame(out)
+
+
+def render_aggrid_position_table(data: list[dict], expand_all: bool, expanded_syms: set, otr_map: dict | None = None):
+    """Render a real interactive grid with in-header dropdown filters and auto-sized columns."""
+    try:
+        from st_aggrid import AgGrid, GridOptionsBuilder, JsCode
+    except Exception:
+        st.error("Column filters need streamlit-aggrid. Install once: pip install streamlit-aggrid")
+        return False
+
+    grid_df = build_aggrid_rows(data, expand_all, expanded_syms, otr_map=otr_map)
+
+    # PyArrow/AgGrid is strict about mixed dtypes. Keep ID/text columns as
+    # strings and numeric columns as numeric so filters and sorting work cleanly.
+    text_cols = ["Symbol / Expiry", "Token", "Real Sig", "Final Sig", "⚡", "Last Fill", "OTR", "_row_type"]
+    for col in text_cols:
+        if col in grid_df.columns:
+            grid_df[col] = grid_df[col].fillna("").astype(str)
+    for col in grid_df.columns:
+        if col not in text_cols:
+            grid_df[col] = pd.to_numeric(grid_df[col], errors="coerce")
+
+    # Header dropdown filters: each column filter icon opens a checklist of
+    # values directly from that column header. No separate filter panel.
+    filter_cols = [c for c in grid_df.columns if c != "_row_type"]
+
+    def _filter_values_for_col(col):
+        vals = []
+        for v in grid_df[col].tolist():
+            if v is None or (isinstance(v, float) and math.isnan(v)):
+                vals.append(None)
+            elif col in text_cols:
+                vals.append(str(v).strip())
+            else:
+                try:
+                    vals.append(float(v))
+                except Exception:
+                    vals.append(v)
+        def _sort_key(x):
+            if x is None or x == "":
+                return (2, "")
+            if isinstance(x, (int, float)) and not isinstance(x, bool):
+                return (0, float(x))
+            return (1, str(x))
+        return sorted(set(vals), key=_sort_key)
+
+    _set_filter_params = {
+        c: {
+            "values": _filter_values_for_col(c),
+            "buttons": ["reset", "apply"],
+            "closeOnApply": True,
+            "suppressMiniFilter": False,
+        }
+        for c in filter_cols
+    }
+
+    gb = GridOptionsBuilder.from_dataframe(grid_df)
+    gb.configure_default_column(
+        sortable=True,
+        filter="agSetColumnFilter",
+        resizable=True,
+        floatingFilter=False,
+        suppressMenu=False,
+        menuTabs=["filterMenuTab"],
+        minWidth=54,
+        wrapHeaderText=False,
+        autoHeaderHeight=False,
+    )
+    gb.configure_column("_row_type", hide=True)
+
+    # Widths tuned for the dashboard screenshot: compact signal/flag columns,
+    # wider PnL/price columns, and the symbol pinned on the left.
+    width_map = {
+        # Initial compact widths. After render, AgGrid auto-sizes each column
+        # from visible header + cell contents, so names stay readable without
+        # wasting horizontal space.
+        "Symbol / Expiry": 140, "Lot Size": 78, "Token": 74, "Real Sig": 76, "Final Sig": 82,
+        "LTP": 78, "Buy Avg": 82, "Sell Avg": 84, "Carry Lots": 86,
+        "Carry Avg": 86, "Lots": 62, "⚡": 42, "Carry Exp.(Cr)": 104,
+        "Net Exp.(Cr)": 96, "Traded Val(Cr)": 108, "Cost": 72,
+        "Cost%(Bips)": 94, "Carry PnL": 90, "Realized": 86,
+        "Unrealized": 96, "Day PnL": 86, "Net PnL": 86, "PnL%": 66,
+        "Slippage (bp)": 98, "INR Slip (bp)": 98, "Last Fill": 90,
+    }
+    gb.configure_column("Symbol / Expiry", pinned="left", width=width_map["Symbol / Expiry"], minWidth=120, suppressSizeToFit=True, filter="agSetColumnFilter", filterParams=_set_filter_params.get("Symbol / Expiry", {}))
+    if "Lot Size" in grid_df.columns:
+        gb.configure_column("Lot Size", width=width_map["Lot Size"], minWidth=70, suppressSizeToFit=True, filter="agSetColumnFilter", filterParams=_set_filter_params.get("Lot Size", {}))
+    for c in ["Token", "Real Sig", "Final Sig", "Last Fill", "⚡"]:
+        if c in grid_df.columns:
+            gb.configure_column(c, width=width_map.get(c, 70), minWidth=48, suppressSizeToFit=True, filter="agSetColumnFilter", filterParams=_set_filter_params.get(c, {}))
+    numeric_cols = [c for c in grid_df.columns if c not in ["Symbol / Expiry", "Token", "Real Sig", "Final Sig", "Last Fill", "⚡", "_row_type"]]
+    value_formatter = JsCode("""
+    function(params) {
+      if (params.value === null || params.value === undefined || params.value === '') return '—';
+      let v = Number(params.value);
+      if (isNaN(v)) return params.value;
+      const oneDec = ['Carry Lots','Lots'];
+      const twoDec = ['LTP','Buy Avg','Sell Avg','Carry Avg','Carry Exp.(Cr)','Net Exp.(Cr)','Traded Val(Cr)','Cost%(Bips)','PnL%','Slippage (bp)','INR Slip (bp)'];
+      const zeroDec = ['Cost','Carry PnL','Realized','Unrealized','Day PnL','Net PnL'];
+      let d = twoDec.includes(params.colDef.field) ? 2 : (oneDec.includes(params.colDef.field) ? 1 : 0);
+      if (zeroDec.includes(params.colDef.field)) d = 0;
+      return v.toLocaleString('en-IN', {minimumFractionDigits: d, maximumFractionDigits: d});
+    }
+    """)
+    for c in numeric_cols:
+        gb.configure_column(
+            c,
+            type=["numericColumn"],
+            filter="agSetColumnFilter",
+            filterParams=_set_filter_params.get(c, {}),
+            width=width_map.get(c, 86),
+            minWidth=70 if c == "Lot Size" else 54,
+            suppressSizeToFit=True,
+            valueFormatter=value_formatter,
+        )
+
+    cell_style = JsCode("""
+    function(params) {
+      const dark = {'backgroundColor':'#13151c','color':'#7a8294','fontFamily':'JetBrains Mono, monospace','fontSize':'11px'};
+      const stock = {'backgroundColor':'#1a1d26','color':'#c0c6d4','fontWeight':'600','fontFamily':'JetBrains Mono, monospace','fontSize':'11px'};
+      let s = params.data && params.data._row_type === 'stock' ? stock : dark;
+      const pnlCols = ['Carry PnL','Realized','Unrealized','Day PnL','Net PnL','PnL%','Slippage (bp)','INR Slip (bp)'];
+      if (pnlCols.includes(params.colDef.field) && params.value !== null && params.value !== undefined && params.value !== '') {
+        let v = Number(params.value);
+        if (v > 0) s = {...s, color:'#00e0a4'};
+        if (v < 0) s = {...s, color:'#ff4d57'};
+      }
+      if (params.colDef.field === '⚡' && params.value === '●') s = {...s, color:'#ff4444'};
+      return s;
+    }
+    """)
+    for c in grid_df.columns:
+        if c != "_row_type":
+            gb.configure_column(c, cellStyle=cell_style)
+    grid_options = gb.build()
+    grid_options["rowHeight"] = 27
+    grid_options["headerHeight"] = 34
+    grid_options["floatingFiltersHeight"] = 0
+    grid_options["onFirstDataRendered"] = JsCode("""
+    function(params) {
+      setTimeout(function() {
+        const cols = params.columnApi.getAllColumns().map(c => c.getColId());
+        params.columnApi.autoSizeColumns(cols, false);
+        const symCol = params.columnApi.getColumn('Symbol / Expiry');
+        if (symCol && symCol.getActualWidth() < 130) {
+          params.columnApi.setColumnWidth('Symbol / Expiry', 130);
+        }
+      }, 80);
+    }
+    """)
+    grid_options["suppressRowHoverHighlight"] = False
+    grid_options["enableCellTextSelection"] = True
+    grid_options["suppressHorizontalScroll"] = False
+    grid_options["animateRows"] = False
+
+    # Keep the grid dark even in the empty area below the last row, and make
+    # floating filters visually match the rest of the Streamlit dashboard.
+    custom_css = {
+        ".ag-root-wrapper": {"background-color": "#101218 !important", "border": "1px solid #1e2230 !important"},
+        ".ag-root": {"background-color": "#101218 !important"},
+        ".ag-body-viewport": {"background-color": "#101218 !important"},
+        ".ag-center-cols-viewport": {"background-color": "#101218 !important"},
+        ".ag-header": {"background-color": "#0f1117 !important", "border-bottom": "1px solid #1e2230 !important"},
+        ".ag-header-cell-label": {"align-items": "center !important", "justify-content": "flex-start !important"},
+        ".ag-header-cell-text": {"color": "#7a8294 !important", "font-size": "10px !important", "font-weight": "700 !important", "white-space": "nowrap !important", "line-height": "13px !important", "overflow": "hidden !important", "text-overflow": "clip !important"},
+        ".ag-header-cell-menu-button, .ag-header-icon": {"color": "#7a8294 !important", "opacity": "1 !important"},
+        ".ag-header-cell": {"padding-left": "6px !important", "padding-right": "3px !important"},
+        ".ag-row": {"border-bottom": "1px solid #181b22 !important"},
+        ".ag-cell": {"line-height": "27px !important", "padding-left": "6px !important", "padding-right": "6px !important"},
+        ".ag-pinned-left-cols-container .ag-cell": {"background-color": "#151821 !important"},
+        ".ag-menu": {"background-color": "#151821 !important", "color": "#c0c6d4 !important", "border": "1px solid #2a2f3d !important"},
+        ".ag-filter-body-wrapper": {"background-color": "#151821 !important", "color": "#c0c6d4 !important"},
+        ".ag-set-filter-list": {"background-color": "#151821 !important", "color": "#c0c6d4 !important"},
+        ".ag-input-field-input": {"background-color": "#101218 !important", "color": "#c0c6d4 !important", "border": "1px solid #2a2f3d !important"},
+    }
+
+    height = min(620, max(240, 58 + 27 * (len(grid_df) + 1)))
+    AgGrid(
+        grid_df,
+        gridOptions=grid_options,
+        theme="streamlit",
+        height=height,
+        fit_columns_on_grid_load=False,
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=True,
+        custom_css=custom_css,
+        key="position_book_aggrid",
+    )
+    return True
+
 def main():
     # ── Session state ────────────────────────────────────────
     if "expand_all" not in st.session_state:
@@ -1419,6 +1956,16 @@ def main():
 
     # Handle toggle via query params (set by the HTML anchor links)
     qp = st.query_params
+
+    # Handle sort via query params (?sort=col&asc=0 or asc=1)
+    # State lives in URL — survives autorefresh
+    sort_col = qp.get("sort", None)
+    if sort_col:
+        # asc=1 means ascending was requested by the link. Keep query params so column filters remain visible.
+        asc_param = qp.get("asc", "0")
+        st.session_state["sort_col"] = sort_col
+        st.session_state["sort_asc"] = (asc_param == "1")
+
     tog_sym = qp.get("tog", None)
     if tog_sym:
         if tog_sym == "__all__":
@@ -1518,7 +2065,7 @@ def main():
     k1, k2, k3, k4, k4b, k5, k6, k7, k8 = st.columns(9)
     k1.metric("Net Exposure",   fmt_inr(kpis["net_exp"]))
     k2.metric("Gross Exposure", fmt_inr(kpis["gross_exp"]))
-    k3.metric("Carry PnL",      fmt_inr(kpis["carry"], show_sign=True))
+    k3.metric("Carry PnL",      fmt_inr(kpis["carry_locked"] + kpis["carry"], show_sign=True))
     k4.metric("Day PnL",        fmt_inr(kpis["day"],   show_sign=True))
     cur_net = kpis["net"]
     # Persist Day High in Redis — only update when LIVE data (not DUMMY)
@@ -1563,19 +2110,19 @@ def main():
     # ── Section label ────────────────────────────────────────
     st.html("<div class='section-hdr'>Position Book — Intraday</div>")
 
-    # ── Single unified position table ───────────────────────
-    table_html = build_position_table_html(
+    # ── Interactive position table ──────────────────────────
+    # Uses AgGrid: every column has its own filter box under the header,
+    # and every header remains sortable. This replaces the earlier static
+    # HTML input row, which could render but could not reliably talk back
+    # to Streamlit.
+    _otr_map = fetch_otr_per_symbol(positions=data)
+    render_aggrid_position_table(
         data,
         expand_all    = st.session_state.expand_all,
         expanded_syms = st.session_state.expanded_syms,
+        otr_map       = _otr_map,
     )
-    st.html(f"""
-    <div style="overflow-x:auto; width:100%; transform:rotateX(180deg); -webkit-transform:rotateX(180deg);">
-        <div style="transform:rotateX(180deg); -webkit-transform:rotateX(180deg);">
-            {table_html}
-        </div>
-    </div>
-    """)
+
 
 
 

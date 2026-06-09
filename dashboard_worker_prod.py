@@ -161,13 +161,14 @@ def get_mid_for_window(book_mids: dict[str, float], window_dt: datetime) -> Opti
     Since signals start at 9:30 and book starts at 09:40, there is always
     a clean snapshot available before any trade.
     """
-    # Try exact slot and walk back up to 6 slots (30 min) for safety
-    for delta_mins in range(0, 31, 5):
+    # Try exact slot and walk back up to 3 slots (15 min) only
+    # Beyond 15 min the mid is too stale to be meaningful
+    for delta_mins in range(0, 16, 5):
         candidate = window_dt - timedelta(minutes=delta_mins)
         slot = candidate.strftime("%H%M")
         if slot in book_mids:
             return book_mids[slot]
-    return None
+    return None  # no valid mid found — skip slippage for this fill
 
 
 class SlippageEngine:
@@ -229,6 +230,8 @@ class SlippageEngine:
             else:           # SELL: positive = good (sold above mid)
                 slip = (fill_price - window_mid) / window_mid
             slip_bps = round(slip * 10000, 4)
+            if abs(slip_bps) > 500:
+                slip_bps = None  # mid_at_fill wrong — skip
         else:
             slip_bps = None
 
@@ -311,6 +314,16 @@ class SlippageEngine:
         total_traded   = sum(f["traded_val"] for f in fills)
         return (total_slip_inr / total_traded * 10000) if total_traded else None
 
+    def get_inr_slip_traded_val(self, symbol: str) -> Optional[float]:
+        """Returns Σ traded_val for fills that contributed to inr_slip.
+        Use this as the weight denominator when aggregating inr_slippage across
+        expiries so the weighted average uses the same denominator as the
+        per-symbol computation (fill-level traded_val, not avg-price × qty)."""
+        fills = [f for f in self._fills.get(symbol, []) if f.get("slip_inr") is not None]
+        if not fills:
+            return None
+        return sum(f["traded_val"] for f in fills)
+
     def get_fills(self, symbol: str):
         return self._fills.get(symbol, [])
 
@@ -387,7 +400,7 @@ def save_slippage_log_redis(engine: SlippageEngine, trade_date: str):
 # for a symbol. Keep minimal — Redis is the primary source.
 # ══════════════════════════════════════════════════════════════
 LOT_SIZE_FALLBACK: dict[str, int] = {
-    "NIFTY": 75, "BANKNIFTY": 35, "SENSEX": 10,
+    "NIFTY": 65, "BANKNIFTY": 30, "SENSEX": 20, "MIDCPNIFTY": 120, "BANKEX": 30,
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -818,16 +831,17 @@ def build_positions_from_fills(
             name     = info["name"]
             lot_size = lot_size_map.get(name) or LOT_SIZE_FALLBACK.get(name, 1)
             pos[key] = {
-                "token":    token,
-                "name":     name,
-                "tsym":     info["tsym"],
-                "strike":   info["strike"],
-                "itype":    info["type"],
-                "lot_size": lot_size,
-                "buy_qty":  0.0,
-                "buy_val":  0.0,
-                "sell_qty": 0.0,
-                "sell_val": 0.0,
+                "token":     token,
+                "name":      name,
+                "tsym":      info["tsym"],
+                "strike":    info["strike"],
+                "itype":     info["type"],
+                "is_future": info.get("is_future", False),
+                "lot_size":  lot_size,
+                "buy_qty":   0.0,
+                "buy_val":   0.0,
+                "sell_qty":  0.0,
+                "sell_val":  0.0,
             }
 
         qty   = fill["fillqty"]
@@ -921,6 +935,7 @@ def build_positions_from_fills(
             "tsym":          info["tsym"],
             "strike":        info.get("strike", 0),
             "itype":         info.get("type", ""),
+            "is_future":     info.get("is_future", False),
             "lot_size":      lot_size,
             "buy_qty":       0.0,
             "buy_val":       0.0,
@@ -1003,13 +1018,19 @@ def _eod_from_csv(dt: str) -> dict[int, dict]:
             token         = int(row["token"])
             qty_overnight = float(row["qty_overnight"])
             prev_close    = float(row["prev_close"])
+            # carry_pnl_locked — today's carry frozen at EOD close.
+            # Written by generate_eod.py = qty_overnight × (today_close − yesterday_close).
+            # Falls back to None if column missing (old EOD files without this field).
+            _raw_locked = row.get("carry_pnl_locked", "")
+            carry_pnl_locked = float(_raw_locked) if _raw_locked else None
             result[token] = {
-                "qty_overnight": qty_overnight,
-                "prev_close":    prev_close,
-                "name":          row.get("name", ""),
-                "symbol":        row.get("symbol", ""),
-                "buy_avg":       float(row.get("buy_avg",  0) or 0),
-                "sell_avg":      float(row.get("sell_avg", 0) or 0),
+                "qty_overnight":    qty_overnight,
+                "prev_close":       prev_close,
+                "carry_pnl_locked": carry_pnl_locked,
+                "name":             row.get("name", ""),
+                "symbol":           row.get("symbol", ""),
+                "buy_avg":          float(row.get("buy_avg",  0) or 0),
+                "sell_avg":         float(row.get("sell_avg", 0) or 0),
             }
         except (KeyError, ValueError):
             continue
@@ -1261,14 +1282,21 @@ def get_ltp_map(r_ltp: redis.Redis, positions: dict, r_idx: redis.Redis = None) 
                 except Exception:
                     pass
         else:
-            # ── Stock instrument — use old feeder keys ────────────────────────
-            try:
-                val = r_ltp.hget(f"fo:stock_option:{sym}:{tsym}", "ltp")
-                if val:
-                    ltp = float(val)
-            except Exception:
-                pass
-
+            # ── Stock instrument — futures first, then option, then spot ────────
+            if is_future:
+                try:
+                    val = r_ltp.hget(f"fo:stock_future:{sym}:{tsym}", "ltp")
+                    if val:
+                        ltp = float(val)
+                except Exception:
+                    pass
+            if not ltp:
+                try:
+                    val = r_ltp.hget(f"fo:stock_option:{sym}:{tsym}", "ltp")
+                    if val:
+                        ltp = float(val)
+                except Exception:
+                    pass
             if not ltp:
                 try:
                     val = r_ltp.hget(f"fo:stock_spot:{sym}", "ltp")
@@ -1284,6 +1312,52 @@ def get_ltp_map(r_ltp: redis.Redis, positions: dict, r_idx: redis.Redis = None) 
             ltp_map[key] = p["buy_avg"] or p["sell_avg"] or 0.0
 
     return ltp_map
+
+
+def get_close_map(r_ltp: redis.Redis, positions: dict, r_idx: redis.Redis = None) -> dict[str, float]:
+    """
+    Fetch previous day closing price for each position from Redis.
+    Uses 'close' field from fo:stock_future / fo:index_futures keys.
+    This is used to populate prev_close for intraday-only positions
+    (where EOD has qty_overnight=0 and prev_close=0).
+
+    Returns { token_str: close_price_float }
+    """
+    if r_idx is None:
+        r_idx = r_ltp
+    close_map: dict[str, float] = {}
+
+    for key, p in positions.items():
+        sym       = p["name"]
+        tsym      = p["tsym"]
+        is_future = p.get("is_future", False)
+        close     = None
+
+        try:
+            if sym in FEEDER_INDICES:
+                val = r_idx.hget(f"fo:index_futures:{sym}", "close")
+                if val:
+                    close = float(val)
+            else:
+                if is_future:
+                    val = r_ltp.hget(f"fo:stock_future:{sym}:{tsym}", "close")
+                    if val:
+                        close = float(val)
+                if not close:
+                    val = r_ltp.hget(f"fo:stock_option:{sym}:{tsym}", "close")
+                    if val:
+                        close = float(val)
+                if not close:
+                    val = r_ltp.hget(f"fo:stock_spot:{sym}", "close")
+                    if val:
+                        close = float(val)
+        except Exception:
+            pass
+
+        if close and close > 0:
+            close_map[key] = close
+
+    return close_map
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1368,6 +1442,7 @@ def build_positions_from_eod(eod_map: dict, token_map: dict, lot_size_map: dict)
             "expiry":        expiry,
             "lot_size":      lot_size,
             "tsym":          meta.get("tsym", ""),
+            "is_future":     meta.get("is_future", False),
             "buy_qty":       0.0,
             "buy_val":       0.0,
             "buy_avg":       0.0,
@@ -1380,19 +1455,67 @@ def build_positions_from_eod(eod_map: dict, token_map: dict, lot_size_map: dict)
     return positions
 
 
-def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict, slip_engine=None) -> list[dict]:
+# Symbols to exclude from dashboard display
+EXCLUDE_SYMS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
+
+def load_locked_carry_from_snapshot(dt: str) -> dict[str, float]:
+    """
+    Load carry_pnl values locked at EOD close from a previous day's snapshot CSV.
+    Returns { expiry_label(str): carry_pnl(float) }
+    e.g. { "BEL20260626": 7600.0, "INFY20260626": -360.0 }
+    dt : YYYYMMDD string of the trading day whose snapshot we want to read.
+    """
+    import csv as _csv
+    remote_dir  = f"{REMOTE_DASHBOARD_DIR}/{SNAPSHOT_SUBDIR}"
+    remote_path = f"{remote_dir}/dashboard_snapshot_{dt}.csv"
+    lines = read_remote_file_lines(remote_path)
+    if not lines:
+        log.debug("No snapshot found for %s — locked carry will be 0", dt)
+        return {}
+    result: dict[str, float] = {}
+    try:
+        reader = _csv.DictReader(lines)
+        for row in reader:
+            label     = row.get("expiry_label", "")
+            carry_raw = row.get("carry_pnl", "")
+            if label and carry_raw:
+                try:
+                    result[label] = float(carry_raw)
+                except ValueError:
+                    pass
+    except Exception as _e:
+        log.warning("Failed to parse snapshot CSV for locked carry (%s): %s", dt, _e)
+    log.info("Locked carry loaded: %d labels from snapshot %s", len(result), dt)
+    return result
+
+
+def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict,
+                   slip_engine=None, close_map: dict = None,
+                   locked_carry_map: dict = None,
+                   eod_date: str = "") -> list[dict]:
     """
     Returns dashboard DATA format:
     [
       { sym, lot_size, book, expiries: [ {label, qty_overnight, ...}, ... ] },
       ...
     ]
-    eod_map: { token(int): { qty_overnight, prev_close } }
+    eod_map          : { token(int): { qty_overnight, prev_close } }
+    close_map        : { token_str: close_price } — Redis 'close' field fallback
+                       for intraday-only positions where prev_close=0
+    locked_carry_map : { expiry_label(str): carry_pnl(float) } — carry locked at
+                       previous day's close; from yesterday's snapshot CSV
+    eod_date         : YYYYMMDD string of the EOD date these overnight positions came from
     """
+    if close_map is None:
+        close_map = {}
+    if locked_carry_map is None:
+        locked_carry_map = {}
     stock_map: dict[str, dict] = {}
 
     for key, p in positions.items():
         sym      = p["name"]
+        if sym in EXCLUDE_SYMS:
+            continue  # skip index instruments
         lot_size = p["lot_size"]
         ltp      = ltp_map.get(key, 0.0)
         token    = p["token"]
@@ -1401,6 +1524,17 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict, slip_engine=No
         # fallback to eod_map by token
         qty_overnight = p.get("qty_overnight") or eod_map.get(token, {}).get("qty_overnight", 0.0)
         prev_close    = p.get("prev_close")    or eod_map.get(token, {}).get("prev_close",    0.0)
+
+        # ── prev_close override: always prefer the official Redis 'close' field ──
+        # The EOD CSV's prev_close may be the last fill price (from _eod_from_log),
+        # not the official NSE futures settlement price.  The Redis feeder populates
+        # the 'close' field from exchange data, which is the correct reference price
+        # for carry PnL and Carry Avg display.
+        # Override for ALL overnight positions (not just intraday-only fallback).
+        if key in close_map and close_map[key] > 0:
+            prev_close = close_map[key]
+        elif not prev_close:
+            prev_close = 0.0
 
         if sym not in stock_map:
             stock_map[sym] = {
@@ -1419,28 +1553,56 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict, slip_engine=No
         # Slippage — both metrics from SlippageEngine
         # slip_bps     : qty-weighted avg (existing)
         # inr_slip_bps : INR-weighted avg (new M2 formula)
-        slip_bps_val     = slip_engine.get_weighted_slip(sym) if slip_engine else None
-        inr_slip_bps_val = slip_engine.get_inr_slip(sym)      if slip_engine else None
-        slippage         = (slip_bps_val     / 10000) if slip_bps_val     is not None else None
-        inr_slippage     = (inr_slip_bps_val / 10000) if inr_slip_bps_val is not None else None
+        slip_bps_val          = slip_engine.get_weighted_slip(sym)       if slip_engine else None
+        inr_slip_bps_val      = slip_engine.get_inr_slip(sym)            if slip_engine else None
+        inr_slip_traded_val   = slip_engine.get_inr_slip_traded_val(sym) if slip_engine else None
+        slippage              = (slip_bps_val     / 10000) if slip_bps_val     is not None else None
+        inr_slippage          = (inr_slip_bps_val / 10000) if inr_slip_bps_val is not None else None
         fill_qty       = qty_today_buy + qty_today_sell
         traded_value   = p["buy_val"] + p["sell_val"]
         avg_fill_price = (traded_value / fill_qty) if fill_qty > 0 else None
 
+        # Last fill time for this symbol
+        _sym_fills = slip_engine.get_fills(sym) if slip_engine else []
+        _last_fill_time = ""
+        if _sym_fills:
+            _last = max(_sym_fills, key=lambda f: f.get("time_ist", ""), default=None)
+            if _last and _last.get("time_ist"):
+                _last_fill_time = _last["time_ist"]  # HH:MM:SS string
+
+        # Locked carry: PnL frozen at yesterday's close.
+        # Priority:
+        #   1. EOD CSV carry_pnl_locked field — written by generate_eod.py at EOD.
+        #      Most reliable: computed at actual close with official settlement price.
+        #   2. Snapshot CSV (locked_carry_map) — fallback for old EOD files without the field.
+        #   3. None → dashboard shows 0 (first day / no prior data).
+        _tsym = p["tsym"]
+        carry_pnl_locked = (
+            eod_map.get(token, {}).get("carry_pnl_locked") or   # 1. EOD CSV (preferred)
+            locked_carry_map.get(_tsym, None)                    # 2. snapshot fallback
+        )
+
         stock_map[sym]["expiries"].append({
-            "label":           p["tsym"],
-            "token":           token,
-            "qty_overnight":   qty_overnight,
-            "prev_close":      prev_close,
-            "qty_today_buy":   qty_today_buy,
-            "qty_today_sell":  qty_today_sell,
-            "buy_avg":         p["buy_avg"]  or eod_map.get(token, {}).get("buy_avg",  0.0),
-            "sell_avg":        p["sell_avg"] or eod_map.get(token, {}).get("sell_avg", 0.0),
-            "ltp":             ltp,
-            "mtd":             0.0,
-            "slippage":        slippage,
-            "inr_slippage":    inr_slippage,
-            "avg_fill_price":  avg_fill_price,
+            "label":            _tsym,
+            "token":            token,
+            "qty_overnight":    qty_overnight,
+            "prev_close":       prev_close,
+            "qty_today_buy":    qty_today_buy,
+            "qty_today_sell":   qty_today_sell,
+            "buy_avg":          p["buy_avg"]  or eod_map.get(token, {}).get("buy_avg",  0.0),
+            "sell_avg":         p["sell_avg"] or eod_map.get(token, {}).get("sell_avg", 0.0),
+            "ltp":              ltp,
+            "mtd":              0.0,
+            "slippage":              slippage,
+            "inr_slippage":          inr_slippage,
+            "inr_slip_traded_val":   inr_slip_traded_val,
+            "avg_fill_price":   avg_fill_price,
+            "last_fill_time":   _last_fill_time,
+            # carry_pnl_locked : carry earned up to & including previous trading day close.
+            #                    None = no yesterday snapshot available (dashboard shows 0).
+            # eod_date         : YYYYMMDD of the EOD that sourced qty_overnight.
+            "carry_pnl_locked": carry_pnl_locked,
+            "eod_date":         eod_date,
         })
 
     return list(stock_map.values())
@@ -1556,8 +1718,9 @@ def build_snapshot_rows(data: list[dict], as_of: str, log_date: str) -> list[dic
                 "expenses":       pnl["expenses"],
                 "net_pnl":        pnl["net_pnl"],
                 "stock_net_pnl":  stock_net_pnl,
-                "slippage":       round(e["slippage"],     8) if e.get("slippage")     is not None else None,
-                "inr_slippage":   round(e["inr_slippage"], 8) if e.get("inr_slippage") is not None else None,
+                "slippage":              round(e["slippage"],            8) if e.get("slippage")            is not None else None,
+                "inr_slippage":          round(e["inr_slippage"],        8) if e.get("inr_slippage")        is not None else None,
+                "inr_slip_traded_val":   round(e["inr_slip_traded_val"], 2) if e.get("inr_slip_traded_val") is not None else None,
             })
     return rows
 
@@ -1705,7 +1868,11 @@ def main():
                     # Build positions from EOD only (zero intraday fills)
                     positions = build_positions_from_eod(eod_map, token_map, lot_size_map)
                     ltp_map   = get_ltp_map(r_ltp, positions, r_idx)
-                    data      = group_by_stock(positions, ltp_map, eod_map, None)
+                    close_map        = get_close_map(r_ltp, positions, r_idx)
+                    _eod_date        = prev_trading_date()
+                    _locked_carry    = load_locked_carry_from_snapshot(_eod_date)
+                    data             = group_by_stock(positions, ltp_map, eod_map, None,
+                                                      close_map, _locked_carry, _eod_date)
                     log.info("EOD-only positions: %d stocks", len(data))
                 else:
                     data = []
@@ -1720,6 +1887,7 @@ def main():
                 payload = json.dumps({
                     "as_of":     datetime.now().isoformat(timespec="seconds"),
                     "log_date":  _log_date_fmt,
+                    "eod_date":  _eod_date,
                     "positions": data,
                     "source":    "log_file",
                 })
@@ -1799,7 +1967,11 @@ def main():
                     log.warning("Incremental slippage CSV save failed: %s", _e)
 
             # 6. Group by stock for dashboard format
-            data = group_by_stock(positions, ltp_map, eod_map, slip_eng)
+            close_map     = get_close_map(r_ltp, positions, r_idx)
+            _eod_date     = prev_trading_date()
+            _locked_carry = load_locked_carry_from_snapshot(_eod_date)
+            data = group_by_stock(positions, ltp_map, eod_map, slip_eng, close_map,
+                                  _locked_carry, _eod_date)
             log.info("Stocks grouped: %d underlyings", len(data))
 
             # 7. Publish to Redis
@@ -1815,6 +1987,7 @@ def main():
             payload = json.dumps({
                 "as_of":     _as_of,
                 "log_date":  _log_date_fmt,
+                "eod_date":  _eod_date,
                 "positions": data,
                 "source":    "log_file",
             }, ensure_ascii=False)
