@@ -90,7 +90,7 @@ def show_dropcopy_pnl_tab():
                    gridcolor="rgba(255,255,255,0.05)"),
         hovermode="x unified",
     )
-    st.plotly_chart(fig1, use_container_width=True)
+    st.plotly_chart(fig1, width="stretch")
 
     # ── Daily MTM Move bar chart ──────────────────────────────────
     st.markdown("#### Daily MTM Move")
@@ -114,7 +114,7 @@ def show_dropcopy_pnl_tab():
         yaxis=dict(title="₹", showgrid=True,
                    gridcolor="rgba(255,255,255,0.05)"),
     )
-    st.plotly_chart(fig2, use_container_width=True)
+    st.plotly_chart(fig2, width="stretch")
 
     # ── Table ─────────────────────────────────────────────────────
     st.markdown("#### Day-wise PnL Table")
@@ -146,6 +146,6 @@ def show_dropcopy_pnl_tab():
                 "Traded Val (₹)":     "₹{:,.0f}",
                 "Expenses (₹)":       "₹{:,.0f}",
             }),
-        use_container_width=True,
+        width="stretch",
         height=min(400, 60 + len(disp) * 35),
     )
