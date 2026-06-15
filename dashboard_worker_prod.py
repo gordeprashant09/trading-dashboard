@@ -74,7 +74,7 @@ COLO_REDIS_DB   = int(os.getenv("COLO_REDIS_DB", "1"))
 # Snapshot saved once per day when IST time crosses EOD_SNAPSHOT_TIME.
 # Filename: dashboard_snapshot_<YYYYMMDD>.csv  (date comes from log filename)
 # Saved to REMOTE_DASHBOARD_DIR/snapshots/ on the colo server via SFTP.
-EOD_SNAPSHOT_TIME = os.getenv("EOD_SNAPSHOT_TIME", "15:30")   # HH:MM IST
+EOD_SNAPSHOT_TIME = os.getenv("EOD_SNAPSHOT_TIME", "15:32")   # HH:MM IST
 SNAPSHOT_SUBDIR   = os.getenv("SNAPSHOT_SUBDIR",   "snapshots")  # under REMOTE_DASHBOARD_DIR
 
 # stocks.csv — same file used by stock_realtime_feeder
@@ -199,10 +199,13 @@ class SlippageEngine:
 
     def add_fill(self, symbol: str, fill_time_ist: datetime,
                  fill_price: float, qty_lots: float, side: int,
-                 mid_at_fill: float, lot_size: int = 1):
+                 mid_at_fill: float, lot_size: int = 1,
+                 t1_sec: float = None):
         """
         mid_at_fill : mid from book snapshot at window start (pre-order, clean)
         side        : 1 = BUY, 2 = SELL
+        t1_sec      : exchange→strategy latency in seconds, computed from
+                      line-prefix wall-clock minus FTRD fill_timestamp.
         """
         if symbol not in self._fills:
             self._fills[symbol]   = []
@@ -253,6 +256,7 @@ class SlippageEngine:
             "symbol":                symbol,
             "time_ist":              fill_time_ist.strftime("%H:%M:%S"),
             "date":                  fill_time_ist.strftime("%Y%m%d"),
+            "t1_sec":                t1_sec,          # real order-to-fill latency
             "side":                  "BUY" if side == 1 else "SELL",
             "fill_price":            fill_price,
             "qty_lots":              qty_lots,
@@ -367,6 +371,7 @@ def save_slippage_log_csv(engine: SlippageEngine, trade_date: str, ssh_client) -
         "window_id", "window_slot", "window_start", "window_mid",
         "weighted_avg_slip_bps",
         "inr_slip_bps",
+        "t1_sec",    # real order-to-fill latency in seconds (from timestamp1)
     ]
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, extrasaction="ignore")
@@ -446,7 +451,7 @@ def log_file_path(dt: str = None) -> str:
                        timeout=10)
         # Find any algo_1 log for today's date
         _, stdout, _ = client.exec_command(
-            f"ls {REMOTE_LOG_DIR}/*algo_1_{dt}.log 2>/dev/null | head -1"
+            f"ls {REMOTE_LOG_DIR}/Strategy-June2_algo_1_{dt}.log 2>/dev/null | head -1"
         )
         found = stdout.read().decode().strip()
         client.close()
@@ -679,21 +684,46 @@ def read_remote_file_lines(remote_path: str) -> list[str]:
         return []
 
 
+# FTRD format in algo log (Strategy-June2_algo_1_YYYYMMDD.log):
+#
+#   LINE PREFIX:  HH:MM:SS:nanoseconds  (strategy wall-clock, IST)
+#   e.g.  04:00:00:501141250 :emit_trade_fill::FTRD:...
+#
+#   FTRD fields (comma-separated, 11 total):
+#   [1]  transactioncode
+#   [2]  response_ordernumber  (float string, e.g. "75000001.000000")
+#   [3]  buy_sell              (1=Buy, 2=Sell)
+#   [4]  originalvol / fillqty sent
+#   [5]  remaining_vol
+#   [6]  price (paise)
+#   [7]  fillnumber
+#   [8]  fillqty
+#   [9]  fillprice (paise)
+#   [10] token
+#   [11] fill_timestamp_ist    (YYYY-MM-DD HH:MM:SS.nanoseconds, IST)
+#
+# T1 = line-prefix wall-clock time − fill_timestamp_ist
+# (strategy receipt time minus exchange fill time — pure latency)
 FTRD_RE = re.compile(
-    r"FTRD:"
-    r"(\d+),"           # transactioncode
-    r"([\d.]+),"        # response_ordernumber
-    r"(\d+),"           # buy_sell  (1=Buy, 2=Sell)
-    r"(-?\d+),"         # originalvol
-    r"(-?\d+),"         # remaining_vol
-    r"(\d+),"           # price
-    r"(\d+),"           # fillnumber
-    r"(\d+),"           # fillqty
-    r"(\d+),"           # fillprice
-    r"(\d+)"            # token
+    r"emit_trade_fill::FTRD:"
+    r"(?P<transactioncode>\d+),"         # 1  transactioncode
+    r"(?P<response_ordernumber>[\d.]+)," # 2  response_ordernumber
+    r"(?P<buy_sell>\d+),"                # 3  buy_sell (1=Buy, 2=Sell)
+    r"(?P<originalvol>-?\d+),"           # 4  originalvol
+    r"(?P<remaining_vol>-?\d+),"         # 5  remaining_vol
+    r"(?P<price>\d+),"                   # 6  price (paise)
+    r"(?P<fillnumber>\d+),"              # 7  fillnumber
+    r"(?P<fillqty>\d+),"                 # 8  fillqty
+    r"(?P<fillprice>\d+),"               # 9  fillprice (paise)
+    r"(?P<token>\d+),"                   # 10 token
+    r"(?P<fill_ts>\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\.\d+)"  # 11 fill timestamp IST
 )
 
-# Regex to extract IST timestamp from FTRD line: 2026-05-26 10:46:51.595222783
+# Line-prefix wall-clock: "04:00:00:501141250" → HH:MM:SS + nanoseconds
+# This is the strategy's local IST clock at the moment the fill was received.
+FTRD_PREFIX_RE = re.compile(r"^\s*(\d{2}):(\d{2}):(\d{2}):(\d+)\s")
+
+# IST wall-clock timestamp in fill_ts field: 2026-06-09 09:30:00.501054331
 FTRD_IST_RE = re.compile(r"(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})")
 
 # Regex to extract mid price from EXECUTION_STRATEGY_LIVE line
@@ -755,19 +785,46 @@ def parse_ftrd_lines(log_path: str) -> list[dict]:
         if not m:
             continue
         try:
-            token      = int(m.group(10))
-            fillnumber = int(m.group(7))
+            token      = int(m.group("token"))
+            fillnumber = int(m.group("fillnumber"))
 
-            # Extract IST timestamp from FTRD line
-            ts_m = FTRD_IST_RE.search(line)
+            # ── Fill timestamp: last field in FTRD — "2026-06-09 09:30:00.501054331"
             fill_time_ist = None
-            if ts_m:
-                try:
-                    fill_time_ist = datetime.strptime(
-                        ts_m.group(1), "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=IST)
-                except ValueError:
-                    pass
+            fill_ts_raw = m.group("fill_ts").strip()
+            try:
+                fill_time_ist = datetime.strptime(
+                    fill_ts_raw[:19], "%Y-%m-%d %H:%M:%S"
+                ).replace(tzinfo=IST)
+            except ValueError:
+                pass
+
+            # ── Strategy receipt time: line prefix "HH:MM:SS:nanoseconds"
+            # T1 = strategy_receipt_time - fill_timestamp  (exchange-to-strategy latency)
+            # Both are IST. The prefix nanoseconds gives sub-second precision.
+            t1_sec = None
+            try:
+                pfx = FTRD_PREFIX_RE.match(line)
+                if pfx and fill_time_ist:
+                    rx_h, rx_m, rx_s, rx_ns = (
+                        int(pfx.group(1)), int(pfx.group(2)),
+                        int(pfx.group(3)), int(pfx.group(4))
+                    )
+                    # fill_ts nanoseconds (fractional part)
+                    fill_ns_str = fill_ts_raw[20:] if len(fill_ts_raw) > 19 else "0"
+                    fill_ns = int(fill_ns_str.ljust(9, "0")[:9])
+
+                    rx_total_ns  = (rx_h * 3600 + rx_m * 60 + rx_s) * 1_000_000_000 + rx_ns
+                    fill_total_ns = (
+                        fill_time_ist.hour * 3600 +
+                        fill_time_ist.minute * 60 +
+                        fill_time_ist.second
+                    ) * 1_000_000_000 + fill_ns
+
+                    delta_ns = rx_total_ns - fill_total_ns
+                    if 0 <= delta_ns <= 60_000_000_000:   # 0 – 60 s
+                        t1_sec = round(delta_ns / 1e9, 4)
+            except Exception:
+                pass
 
             # Extract line number if available (from grep -n output)
             ln_m = re.match(r"(\d+):", line)
@@ -775,13 +832,14 @@ def parse_ftrd_lines(log_path: str) -> list[dict]:
 
             fill_minute = fill_time_ist.strftime("%Y%m%d%H%M") if fill_time_ist else ""
             seen[(token, fillnumber, fill_minute)] = {
-                "order_no":      m.group(2),
-                "buy_sell":      int(m.group(3)),   # 1=Buy 2=Sell
-                "fillqty":       int(m.group(8)),
-                "fillprice":     int(m.group(9)) / PRICE_DIVISOR,
+                "order_no":      m.group("response_ordernumber"),
+                "buy_sell":      int(m.group("buy_sell")),   # 1=Buy 2=Sell
+                "fillqty":       int(m.group("fillqty")),
+                "fillprice":     int(m.group("fillprice")) / PRICE_DIVISOR,
                 "token":         token,
                 "fillnumber":    fillnumber,
                 "fill_time_ist": fill_time_ist,
+                "t1_sec":        t1_sec,    # exchange→strategy latency in seconds
                 "line_no":       line_no,
                 "mid_at_fill":   None,
             }
@@ -1107,10 +1165,10 @@ def _eod_from_log(log_path: str) -> dict[int, dict]:
         if not m:
             continue
         try:
-            token     = int(m.group(10))
-            buy_sell  = int(m.group(3))
-            fillqty   = int(m.group(8))
-            fillprice = int(m.group(9)) / PRICE_DIVISOR
+            token     = int(m.group("token"))
+            buy_sell  = int(m.group("buy_sell"))
+            fillqty   = int(m.group("fillqty"))
+            fillprice = int(m.group("fillprice")) / PRICE_DIVISOR
 
             if token not in eod:
                 eod[token] = {"net_qty": 0.0, "last_price": 0.0}
@@ -1340,9 +1398,16 @@ def get_close_map(r_ltp: redis.Redis, positions: dict, r_idx: redis.Redis = None
                     close = float(val)
             else:
                 if is_future:
-                    val = r_ltp.hget(f"fo:stock_future:{sym}:{tsym}", "close")
-                    if val:
+                    # Priority 1: bhav_close — official NSE settlement pushed by
+                    # bhavcopy_pipeline.py. Feeder does NOT touch this field.
+                    val = r_ltp.hget(f"fo:stock_future:{sym}:{tsym}", "bhav_close")
+                    if val and float(val) > 0:
                         close = float(val)
+                    # Priority 2: close — feeder field (may be overwritten by feeder)
+                    if not close:
+                        val = r_ltp.hget(f"fo:stock_future:{sym}:{tsym}", "close")
+                        if val:
+                            close = float(val)
                 if not close:
                     val = r_ltp.hget(f"fo:stock_option:{sym}:{tsym}", "close")
                     if val:
@@ -1589,8 +1654,11 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict,
             "prev_close":       prev_close,
             "qty_today_buy":    qty_today_buy,
             "qty_today_sell":   qty_today_sell,
-            "buy_avg":          p["buy_avg"]  or eod_map.get(token, {}).get("buy_avg",  0.0),
-            "sell_avg":         p["sell_avg"] or eod_map.get(token, {}).get("sell_avg", 0.0),
+            # Only use EOD avg if today has actual fills — otherwise show 0
+            "buy_avg":          p["buy_avg"]  if p["buy_qty"]  > 0 else 0.0,
+            "sell_avg":         p["sell_avg"] if p["sell_qty"] > 0 else 0.0,
+            "buy_tv":           p.get("buy_val", 0.0),
+            "sell_tv":          p.get("sell_val", 0.0),
             "ltp":              ltp,
             "mtd":              0.0,
             "slippage":              slippage,
@@ -1672,7 +1740,55 @@ def _calc_pnl_for_snapshot(e: dict, lot_size: int) -> dict:
     }
 
 
-def build_snapshot_rows(data: list[dict], as_of: str, log_date: str) -> list[dict]:
+def fetch_otr_per_symbol(data: list[dict]) -> dict:
+    """OTR per symbol: orders_sent / fills from today strategy log."""
+    import re as _re
+    try:
+        from datetime import date as _date
+        trade_date = _date.today().strftime("%Y%m%d")
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        client.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASS, timeout=5)
+        _, out, _ = client.exec_command(
+            f"ls /data/logs/Strategy-June2_algo_1_{trade_date}.log 2>/dev/null | head -1")
+        log_path = out.read().decode().strip()
+        if not log_path:
+            client.close(); return {}
+        _, out, _ = client.exec_command(
+            f"grep -E 'send_order::EXECUTION_STRATEGY_LIVE|emit_trade_fill::FTRD' {log_path}")
+        lines = out.read().decode("utf-8", errors="replace").splitlines()
+        client.close()
+        tok2sym = {}
+        for _stock in data:
+            _sym = _stock.get("sym", "")
+            for _e in _stock.get("expiries", []):
+                _tok = str(_e.get("token", "")).strip()
+                if _tok and _sym: tok2sym[_tok] = _sym
+        orders_ct: dict = {}
+        fills_ct:  dict = {}
+        re_send = _re.compile(r"order=\[(\d+),")
+        re_ftrd = _re.compile(r"FTRD:[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,(\d+),")
+        for line in lines:
+            if "send_order" in line:
+                m = re_send.search(line)
+                if m:
+                    t = m.group(1); orders_ct[t] = orders_ct.get(t, 0) + 1
+            elif "FTRD" in line:
+                m = re_ftrd.search(line)
+                if m:
+                    t = m.group(1); fills_ct[t] = fills_ct.get(t, 0) + 1
+        result = {}
+        for tok in set(list(orders_ct) + list(fills_ct)):
+            sym = tok2sym.get(tok, tok)
+            o = orders_ct.get(tok, 0); f = fills_ct.get(tok, 0)
+            if f > 0:
+                result[sym] = round(o/f, 1)
+        return result
+    except Exception:
+        return {}
+
+
+def build_snapshot_rows(data: list[dict], as_of: str, log_date: str, otr_map: dict | None = None) -> list[dict]:
     """
     Flatten dashboard data into CSV rows.
     One row per expiry, with parent stock aggregates included as extra cols.
@@ -1721,6 +1837,7 @@ def build_snapshot_rows(data: list[dict], as_of: str, log_date: str) -> list[dic
                 "slippage":              round(e["slippage"],            8) if e.get("slippage")            is not None else None,
                 "inr_slippage":          round(e["inr_slippage"],        8) if e.get("inr_slippage")        is not None else None,
                 "inr_slip_traded_val":   round(e["inr_slip_traded_val"], 2) if e.get("inr_slip_traded_val") is not None else None,
+                "otr":           (otr_map or {}).get(sym, None),
             })
     return rows
 
@@ -1746,7 +1863,8 @@ def save_snapshot_to_colo(data: list[dict], as_of: str, log_date: str) -> bool:
     remote_dir  = f"{REMOTE_DASHBOARD_DIR}/{SNAPSHOT_SUBDIR}"
     remote_path = f"{remote_dir}/dashboard_snapshot_{date_tag}.csv"
 
-    rows = build_snapshot_rows(data, as_of, log_date)
+    otr_map = fetch_otr_per_symbol(data)
+    rows = build_snapshot_rows(data, as_of, log_date, otr_map=otr_map)
     if not rows:
         log.warning("Snapshot: no data rows to save — skipping")
         return False
@@ -1947,13 +2065,14 @@ def main():
 
                     if mid and fill_key not in slip_eng._processed_fills:
                         slip_eng.add_fill(
-                            symbol       = sym,
-                            fill_time_ist= fill_time,
-                            fill_price   = fill["fillprice"],
-                            qty_lots     = qty_lots,
-                            side         = fill["buy_sell"],
-                            mid_at_fill  = mid,
-                            lot_size     = lot_size,
+                            symbol        = sym,
+                            fill_time_ist = fill_time,
+                            fill_price    = fill["fillprice"],
+                            qty_lots      = qty_lots,
+                            side          = fill["buy_sell"],
+                            mid_at_fill   = mid,
+                            lot_size      = lot_size,
+                            t1_sec        = fill.get("t1_sec"),  # exchange→strategy latency
                         )
                         slip_eng._processed_fills.add(fill_key)
 
@@ -1973,6 +2092,17 @@ def main():
             data = group_by_stock(positions, ltp_map, eod_map, slip_eng, close_map,
                                   _locked_carry, _eod_date)
             log.info("Stocks grouped: %d underlyings", len(data))
+            # Inject OTR into each expiry before publishing
+            try:
+                _otr_map = fetch_otr_per_symbol(data)
+                for _st in data:
+                    _otr = _otr_map.get(_st["sym"])
+                    for _e in _st.get("expiries", []):
+                        _e["otr"] = _otr
+                if _otr_map:
+                    log.info("OTR injected for %d symbols", len(_otr_map))
+            except Exception as _otr_err:
+                log.warning("OTR fetch failed: %s", _otr_err)
 
             # 7. Publish to Redis
             # Extract actual trade date from fill timestamps (not filename)

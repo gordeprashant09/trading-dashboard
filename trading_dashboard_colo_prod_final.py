@@ -19,6 +19,7 @@ To connect live data:
 from __future__ import annotations
 
 import os
+import logging
 import io
 import csv
 import time
@@ -31,6 +32,8 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+
+log = logging.getLogger(__name__)
 
 # ============================================================
 # PAGE CONFIG
@@ -380,11 +383,11 @@ def fetch_median_slippage_bps():
         remote_path = f"/data/Dashboard/snapshots/slippage_log_{trade_date}.csv"
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect("192.168.71.200", port=22, username="Data_colo", password="Datacolo@2026", timeout=5)
+        client.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASS, timeout=5)
         sftp = client.open_sftp()
         try:
             with sftp.open(remote_path, "r") as f:
-                reader = _csv.DictReader(f.read().decode("utf-8").splitlines())
+                reader = _csv.DictReader(f.read().decode("utf-8", errors="replace").splitlines())
                 total_sv, total_v = 0.0, 0.0
                 for row in reader:
                     try:
@@ -404,40 +407,90 @@ def fetch_median_slippage_bps():
 @st.cache_data(ttl=60)
 def fetch_avg_t1_minutes():
     """
-    Avg T1 = mean(fill_time - window_slot) in seconds (excludes outliers > 60s).
-    window_slot = HHMM when order was sent. Outliers are slow limit orders.
+    Avg T1 = mean(t1_sec) from slippage_log CSV.
+
+    t1_sec is the real order-to-fill latency written by the worker from
+    NSE timestamp1 (order-sent epoch ns) and logtime (fill receipt IST).
+
+    Falls back to window_slot arithmetic for older CSV files that predate
+    the t1_sec column.
+
+    Returns seconds / 60 so the caller can do avg_t1 * 60 to display seconds.
+    Returns None if the CSV is missing or has no usable rows.
     """
     try:
         import paramiko
-        from datetime import date, datetime as dt
-        trade_date = date.today().strftime("%Y%m%d")
-        remote_path = f"/data/Dashboard/snapshots/slippage_log_{trade_date}.csv"
         import csv as _csv
+        from datetime import date, datetime as dt
+
+        trade_date  = date.today().strftime("%Y%m%d")
+        remote_path = f"/data/Dashboard/snapshots/slippage_log_{trade_date}.csv"
+
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect("192.168.71.200", port=22, username="Data_colo", password="Datacolo@2026", timeout=5)
+        client.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASS, timeout=5)
         sftp = client.open_sftp()
+        raw = []
+        parse_errors = 0
         try:
             with sftp.open(remote_path, "r") as f:
-                reader = _csv.DictReader(f.read().decode("utf-8").splitlines())
-                t1_all  = []
-                t1_fast = []
-                for row in reader:
-                    try:
-                        fill_t = dt.strptime(row["time_ist"].strip(), "%H:%M:%S")
-                        slot   = str(row.get("window_slot","")).strip().zfill(4)
-                        slot_t = dt.strptime(f"{slot[:2]}:{slot[2:]}", "%H:%M")
-                        t1_sec = (fill_t - slot_t).total_seconds()
-                        if 0 <= t1_sec <= 600:
-                            t1_all.append(t1_sec)
-                            if t1_sec <= 60:
-                                t1_fast.append(t1_sec)
-                    except: continue
+                raw = f.read().decode("utf-8", errors="replace").splitlines()
         finally:
-            sftp.close(); client.close()
-        t1_use = t1_fast if t1_fast else t1_all
-        return (sum(t1_use) / len(t1_use)) / 60.0 if t1_use else None
-    except Exception:
+            sftp.close()
+            client.close()
+
+        if not raw:
+            log.warning("fetch_avg_t1: empty CSV at %s", remote_path)
+            return None
+
+        reader  = _csv.DictReader(raw)
+        cols    = reader.fieldnames or []
+        t1_vals = []
+        has_t1_col = "t1_sec" in (cols or [])
+
+        for row in reader:
+            try:
+                t1_sec = None
+
+                if has_t1_col:
+                    # ── Primary: real exchange→strategy latency from algo log ──
+                    raw_t1 = row.get("t1_sec", "").strip()
+                    if raw_t1 and raw_t1.lower() not in ("", "none", "null"):
+                        t1_sec = float(raw_t1)
+
+                if t1_sec is None:
+                    # ── Fallback: window_slot arithmetic (older CSV files) ─────
+                    time_ist_raw = row.get("time_ist", "").strip()
+                    slot_raw     = str(row.get("window_slot", "")).strip().zfill(4)
+                    if (time_ist_raw and slot_raw and
+                            slot_raw != "0000" and len(slot_raw) == 4 and slot_raw.isdigit()):
+                        fill_t = dt.strptime(time_ist_raw, "%H:%M:%S")
+                        slot_t = dt.strptime(f"{slot_raw[:2]}:{slot_raw[2:]}", "%H:%M")
+                        t1_sec = (fill_t - slot_t).total_seconds()
+
+                # Clamp: algo log T1 typically 0.001–2 s; > 30 s = outlier/error
+                if t1_sec is not None and 0.001 <= t1_sec <= 30:
+                    t1_vals.append(t1_sec)
+
+            except Exception:
+                parse_errors += 1
+                continue
+
+        if parse_errors:
+            log.warning("fetch_avg_t1: %d rows failed to parse (cols=%s)", parse_errors, cols)
+
+        if not t1_vals:
+            log.warning("fetch_avg_t1: no usable rows — has_t1_col=%s, raw_lines=%d",
+                        has_t1_col, len(raw))
+            return None
+
+        avg_sec = sum(t1_vals) / len(t1_vals)
+        log.info("fetch_avg_t1: %d fills, avg=%.3f s, min=%.3f s, max=%.3f s (t1_col=%s)",
+                 len(t1_vals), avg_sec, min(t1_vals), max(t1_vals), has_t1_col)
+        return avg_sec / 60.0   # caller does × 60 to display seconds
+
+    except Exception as exc:
+        log.error("fetch_avg_t1_minutes failed: %s", exc)
         return None
 
 
@@ -455,7 +508,7 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     open_qty   = e["qty_overnight"] + net_today
     lots       = open_qty / lot_size if lot_size > 0 else None
 
-    # ── Carry PnL logic ──────────────────────────────────────────────────────
+    # ── C PNL logic ──────────────────────────────────────────────────────
     # Split into two parts:
     #   carry_locked : PnL earned up to & including previous day's close.
     #                  Frozen value from yesterday's EOD snapshot CSV.
@@ -466,20 +519,18 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     # The "carry" field shown in the dashboard column is carry_today only —
     # reflecting today's movement from yesterday's close.  carry_locked is
     # preserved separately and shown as the previous day's dated carry row.
-    carry_locked = e.get("carry_pnl_locked") or 0.0   # None → 0
+    # carry_locked is historical — NOT shown in C PNL column
+    # C PNL only shows today's carry = qty × (ltp - prev_close)
+    carry_locked = 0.0
 
     # ── Time gate: carry PnL only live from 9:10 AM IST ──────────────────────
-    # Before 9:10 → pre-open indicative prices are unreliable, show 0.
-    # From 9:10  → pre-open matching is done, LTP is stable enough to use.
     from datetime import datetime as _dt
     from zoneinfo import ZoneInfo as _ZI
-    _now        = _dt.now(tz=_ZI("Asia/Kolkata"))
+    _now         = _dt.now(tz=_ZI("Asia/Kolkata"))
     _market_gate = _now.replace(hour=9, minute=10, second=0, microsecond=0)
-    _market_open = _now < _market_gate
 
-    if _market_open:
-        carry        = 0.0
-        carry_locked = 0.0   # also hide yesterday locked carry before 9:10
+    if _now < _market_gate:
+        carry = 0.0
     else:
         carry = e["qty_overnight"] * (e["ltp"] - e["prev_close"])
 
@@ -498,21 +549,17 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     # FIX: also remove carry for the closed portion to avoid double counting
     qty_on = e["qty_overnight"]
     if qty_on > 0 and open_sel_qty > 0:
-        # Overnight long closed by today's sells
         close_qty    = min(qty_on, open_sel_qty)
-        # Realized = sell_avg - prev_close (LOCKED, LTP-independent)
         realized    += close_qty * (e["sell_avg"] - e["prev_close"])
-        # Remove carry for closed qty (avoid double count with realized)
         carry       -= close_qty * (e["ltp"] - e["prev_close"])
-        unreal_sell  = 0
+        remaining_sel = open_sel_qty - close_qty
+        unreal_sell   = remaining_sel * (e["sell_avg"] - e["ltp"]) if remaining_sel > 0 else 0
     elif qty_on < 0 and open_buy_qty > 0:
-        # Overnight short closed by today's buys
         close_qty    = min(abs(qty_on), open_buy_qty)
-        # Realized = prev_close - buy_avg (LOCKED)
         realized    += close_qty * (e["prev_close"] - e["buy_avg"])
-        # Remove carry for closed qty
         carry       += close_qty * (e["ltp"] - e["prev_close"])
-        unreal_buy   = 0
+        remaining_buy = open_buy_qty - close_qty
+        unreal_buy    = remaining_buy * (e["ltp"] - e["buy_avg"]) if remaining_buy > 0 else 0
 
     day         = realized + unreal_buy + unreal_sell
 
@@ -573,6 +620,8 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
         "open_qty":     open_qty,
         "net_exp":      net_exp,
         "traded_val":   traded_val,
+        "buy_tv":       buy_val,
+        "sell_tv":      sell_val,
         "cost":         expenses,
         "cost_pct":     round((expenses / traded_val * 100), 4) if traded_val else 0.0,
         "carry":              carry,        # today's carry: 0 pre-market, live once LTP feeds
@@ -599,8 +648,7 @@ def fetch_otr_per_symbol(positions: list | None = None) -> dict:
         trade_date = _date.today().strftime("%Y%m%d")
         client = _pm.SSHClient()
         client.set_missing_host_key_policy(_pm.AutoAddPolicy())
-        client.connect("192.168.71.200", port=22, username="Data_colo",
-                       password="Datacolo@2026", timeout=5)
+        client.connect(SSH_HOST, port=SSH_PORT, username=SSH_USER, password=SSH_PASS, timeout=5)
         _, out, _ = client.exec_command(
             f"ls /data/logs/*algo_1_{trade_date}.log 2>/dev/null | head -1")
         log_path = out.read().decode().strip()
@@ -641,7 +689,7 @@ def fetch_otr_per_symbol(positions: list | None = None) -> dict:
 
         orders_ct: dict = {}
         fills_ct:  dict = {}
-        re_send = _re.compile(r'send order=\[(\d+),')
+        re_send = _re.compile(r'order=\[(\d+),')
         re_ftrd = _re.compile(r'FTRD:[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,[^,]+,(\d+),')
 
         for line in lines:
@@ -730,7 +778,7 @@ def build_table(data: list[dict]) -> tuple[pd.DataFrame, dict]:
     Returns (df, kpis)
     """
     rows = []
-    kpis = {"net_exp": 0.0, "gross_exp": 0.0, "carry": 0.0, "carry_locked": 0.0,
+    kpis = {"net_exp": 0.0, "gross_exp": 0.0, "carry": 0.0,
              "day": 0.0, "net": 0.0, "expenses": 0.0, "slippages": []}
 
     for st in data:
@@ -741,7 +789,7 @@ def build_table(data: list[dict]) -> tuple[pd.DataFrame, dict]:
         for e in st["expiries"]:
             r = calc_expiry_pnl(e, lot_size)
             exp_rows.append(r)
-            for k in ["net_exp", "carry", "carry_locked", "day", "net"]:
+            for k in ["net_exp", "carry", "day", "net"]:
                 kpis[k] += r[k]
             kpis["expenses"] += r.get("cost", 0.0)
             if r.get("slippage") is not None:
@@ -762,7 +810,7 @@ def build_table(data: list[dict]) -> tuple[pd.DataFrame, dict]:
             "net_exp":    sum(x["net_exp"]     for x in exp_rows),
             "traded_val": sum(x["traded_val"]  for x in exp_rows),
             "carry":        sum(x["carry"]        for x in exp_rows),
-            "carry_locked": sum(x["carry_locked"]  for x in exp_rows),
+
             "day":          sum(x["day"]           for x in exp_rows),
             "net":          sum(x["net"]           for x in exp_rows),
             "mtd":          sum(x["mtd"]           for x in exp_rows),
@@ -1024,8 +1072,8 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
       <th>Sell Avg</th>
       <th>Lots</th>
       <th>Net Exp.</th>
-      <th>Traded Val</th>
-      <th>Carry PnL</th>
+      <th>TV</th>
+      <th>C PNL</th>
       <th>Realized</th>
       <th>Unrealized</th>
       <th>Day PnL</th>
@@ -1098,7 +1146,7 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
               {lots_td}
               {neutral_td(row["net_exp"])}
               {neutral_td(row["traded_val"])}
-              {pnl_td(row["carry"] + row.get("carry_locked", 0))}
+              {pnl_td(row["carry"])}
               {pnl_td(row["day"])}
               {pnl_td(row["net"])}
               {pct_td(stock_pct)}
@@ -1135,7 +1183,7 @@ def render_table_html(df: pd.DataFrame, expand_all: bool = True, expanded_syms: 
               {lots_html}
               {neutral_td(row["net_exp"])}
               {neutral_td(row["traded_val"])}
-              {pnl_td(row["carry"] + row.get("carry_locked", 0))}
+              {pnl_td(row["carry"])}
               {pnl_td(row["day"])}
               {pnl_td(row["net"])}
               {pct_td(pnl_pct)}
@@ -1172,16 +1220,16 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <col style="width:75px">   <!-- LTP -->
       <col style="width:80px">   <!-- Buy Avg -->
       <col style="width:80px">   <!-- Sell Avg -->
-      <col style="width:55px">   <!-- Carry Lots -->
-      <col style="width:70px">   <!-- Carry Avg -->
+      <col style="width:55px">   <!-- C Lot -->
+      <col style="width:70px">   <!-- C Avg -->
       <col style="width:55px">   <!-- Lots -->
       <col style="width:20px">   <!-- mismatch -->
       <col style="width:70px">   <!-- Carry Exp.(Cr) -->
       <col style="width:70px">   <!-- Net Exp.(Cr) -->
-      <col style="width:80px">   <!-- Traded Val(Cr) -->
+      <col style="width:80px">   <!-- TV(Cr) -->
       <col style="width:50px">   <!-- Cost -->
       <col style="width:60px">   <!-- Cost%(Bips) -->
-      <col style="width:60px">   <!-- Carry PnL -->
+      <col style="width:60px">   <!-- C PNL -->
       <col style="width:80px">   <!-- Realized -->
       <col style="width:80px">   <!-- Unrealized -->
       <col style="width:75px">   <!-- Day PnL -->
@@ -1217,16 +1265,16 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
       <th style="cursor:pointer"><a href="__HREF_ltp__" style="text-decoration:none;color:inherit">LTP <span style="color:__SC_ltp__;font-size:11px;font-weight:bold">__SA_ltp__</span></a></th>
       <th>Buy Avg</th>
       <th>Sell Avg</th>
-      <th>Carry Lots</th>
-      <th style="color:#565c6e">Carry Avg</th>
+      <th>C Lot</th>
+      <th style="color:#565c6e">C Avg</th>
       <th style="cursor:pointer"><a href="__HREF_lots__" style="text-decoration:none;color:inherit">Lots <span style="color:__SC_lots__;font-size:11px;font-weight:bold">__SA_lots__</span></a></th>
       <th title="Signal/Lots mismatch">⚡</th>
       <th>Carry Exp.(Cr)</th>
       <th style="cursor:pointer"><a href="__HREF_netexp__" style="text-decoration:none;color:inherit">Net Exp.(Cr) <span style="color:__SC_netexp__;font-size:11px;font-weight:bold">__SA_netexp__</span></a></th>
-      <th style="cursor:pointer"><a href="__HREF_tv__" style="text-decoration:none;color:inherit">Traded Val(Cr) <span style="color:__SC_tv__;font-size:11px;font-weight:bold">__SA_tv__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_tv__" style="text-decoration:none;color:inherit">TV(Cr) <span style="color:__SC_tv__;font-size:11px;font-weight:bold">__SA_tv__</span></a></th>
       <th>Cost</th>
       <th>Cost%(Bips)</th>
-      <th style="cursor:pointer"><a href="__HREF_carry__" style="text-decoration:none;color:inherit">Carry PnL <span style="color:__SC_carry__;font-size:11px;font-weight:bold">__SA_carry__</span></a></th>
+      <th style="cursor:pointer"><a href="__HREF_carry__" style="text-decoration:none;color:inherit">C PNL <span style="color:__SC_carry__;font-size:11px;font-weight:bold">__SA_carry__</span></a></th>
       <th style="color:#2eca8a;cursor:pointer"><a href="__HREF_real__" style="text-decoration:none;color:inherit">Realized <span style="color:__SC_real__;font-size:11px;font-weight:bold">__SA_real__</span></a></th>
       <th style="color:#e8a825;cursor:pointer"><a href="__HREF_unreal__" style="text-decoration:none;color:inherit">Unrealized <span style="color:__SC_unreal__;font-size:11px;font-weight:bold">__SA_unreal__</span></a></th>
       <th style="cursor:pointer"><a href="__HREF_day__" style="text-decoration:none;color:inherit">Day PnL <span style="color:__SC_day__;font-size:11px;font-weight:bold">__SA_day__</span></a></th>
@@ -1306,8 +1354,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
         stock_lots = total_oq / lot_size if lot_size > 0 else None
         s_net_exp    = sum(x["net_exp"]    for x in exp_calcs)
         s_tval       = sum(x["traded_val"] for x in exp_calcs)
-        s_carry_locked = sum(x.get("carry_locked", 0) for x in exp_calcs)
-        s_carry        = sum(x["carry"]      for x in exp_calcs) + s_carry_locked
+        s_carry        = sum(x["carry"] for x in exp_calcs)
         s_day        = sum(x["day"]        for x in exp_calcs)
         s_net        = sum(x["net"]        for x in exp_calcs)
         s_realized   = sum(x.get("realized",   0) for x in exp_calcs)
@@ -1345,14 +1392,14 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                 latest_b_avg = f"{latest_ec['buy_avg']:,.2f}" if latest_ec.get("buy_avg") else "—"
                 latest_s_avg = f"{latest_ec['sell_avg']:,.2f}" if latest_ec.get("sell_avg") else "—"
 
-        # Carry Lots aggregate
+        # C Lot aggregate
         s_carry_lots   = sum(x["carry_lots"]   for x in exp_calcs)
         s_carry_exp_cr = sum(x["carry_exp_cr"] for x in exp_calcs)
 
-        # Carry Lots td
+        # C Lot td
         cl = round(float(s_carry_lots), 1)
         carry_lots_td = f'<td style="color:#7a8294">{("+" if cl > 0 else "") + str(cl)}</td>' if cl != 0 else '<td class="zer">0.0</td>'
-        # Carry Avg = weighted previous close of overnight carry, never today's fill price.
+        # C Avg = weighted previous close of overnight carry, never today's fill price.
         _carry_notional = 0.0
         _carry_qty_abs  = 0.0
         for _e in item["expiries"]:
@@ -1446,7 +1493,7 @@ def build_position_table_html(data: list[dict], expand_all: bool, expanded_syms:
                 else:
                     pnl_pct_td = '<td class="zer">—</td>'
 
-                # Carry Lots
+                # C Lot
                 ecl = round(float(ec["carry_lots"]), 1)
                 carry_lots_td_exp = f'<td style="color:#7a8294">{("+" if ecl > 0 else "") + str(ecl)}</td>' if ecl != 0 else '<td class="zer">0.0</td>'
                 _ec_prev = ec.get("prev_close", 0.0) or 0.0
@@ -1652,6 +1699,8 @@ def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, ot
         exp_calcs = [calc_expiry_pnl(e, lot_size) for e in item["expiries"]]
         s_open_qty = sum(x["open_qty"] for x in exp_calcs)
         s_tval = sum(x["traded_val"] for x in exp_calcs)
+        s_buy_tv = sum(x.get("buy_tv", 0.0) for x in exp_calcs)
+        s_sell_tv = sum(x.get("sell_tv", 0.0) for x in exp_calcs)
         s_cost = sum(x["cost"] for x in exp_calcs)
         s_cost_pct = sum(x["cost_pct"] for x in exp_calcs if x["traded_val"])
         latest_exp = sorted(item["expiries"], key=lambda x: x["label"])[-1] if item["expiries"] else {}
@@ -1667,7 +1716,7 @@ def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, ot
             tw = sum(w for _, w in _inr_pairs)
             stock_inr_slip = sum(s * w for s, w in _inr_pairs) / tw if tw else None
         s_day = sum(x["day"] for x in exp_calcs)
-        # Carry Avg = weighted previous close of overnight carry, never today's fill price.
+        # C Avg = weighted previous close of overnight carry, never today's fill price.
         carry_prev_num = 0.0
         carry_prev_den = 0.0
         for _e in item["expiries"]:
@@ -1688,16 +1737,16 @@ def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, ot
             "LTP": _fmt_num_for_grid(latest_ec.get("ltp")),
             "Buy Avg": _fmt_num_for_grid(latest_ec.get("buy_avg")),
             "Sell Avg": _fmt_num_for_grid(latest_ec.get("sell_avg")),
-            "Carry Lots": _fmt_num_for_grid(sum(x["carry_lots"] for x in exp_calcs), 1),
-            "Carry Avg": _fmt_num_for_grid(carry_avg_prev_close),
+            "C Lot": _fmt_num_for_grid(sum(x["carry_lots"] for x in exp_calcs), 1),
+            "C Avg": _fmt_num_for_grid(carry_avg_prev_close),
             "Lots": _fmt_num_for_grid(s_open_qty / lot_size if lot_size else None, 1),
             "⚡": "●" if mismatch_td(final_sig, s_open_qty / lot_size if lot_size else None) != '<td></td>' else "",
             "Carry Exp.(Cr)": _fmt_num_for_grid(sum(x["carry_exp_cr"] for x in exp_calcs)),
             "Net Exp.(Cr)": _fmt_num_for_grid(sum(x["net_exp"] for x in exp_calcs) / 1e7),
-            "Traded Val(Cr)": _fmt_num_for_grid(s_tval / 1e7),
+            "TV(Cr)": _fmt_num_for_grid(s_tval / 1e7),
             "Cost": _fmt_num_for_grid(s_cost, 0),
             "Cost%(Bips)": _fmt_num_for_grid(s_cost_pct * 100 if s_tval else None),
-            "Carry PnL": _fmt_num_for_grid(sum(x["carry"] + x.get("carry_locked", 0) for x in exp_calcs), 0),
+            "C PNL": _fmt_num_for_grid(sum(x["carry"] for x in exp_calcs), 0),
             "Realized": _fmt_num_for_grid(sum(x.get("realized", 0) for x in exp_calcs), 0),
             "Unrealized": _fmt_num_for_grid(sum(x.get("unrealized", 0) for x in exp_calcs), 0),
             "Day PnL": _fmt_num_for_grid(s_day, 0),
@@ -1721,16 +1770,16 @@ def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, ot
                     "LTP": _fmt_num_for_grid(ec.get("ltp")),
                     "Buy Avg": _fmt_num_for_grid(ec.get("buy_avg")),
                     "Sell Avg": _fmt_num_for_grid(ec.get("sell_avg")),
-                    "Carry Lots": _fmt_num_for_grid(ec.get("carry_lots"), 1),
-                    "Carry Avg": _fmt_num_for_grid(e.get("prev_close")),
+                    "C Lot": _fmt_num_for_grid(ec.get("carry_lots"), 1),
+                    "C Avg": _fmt_num_for_grid(e.get("prev_close")),
                     "Lots": _fmt_num_for_grid(ec.get("lots"), 1),
                     "⚡": "●" if mismatch_td(final_sig, ec.get("lots")) != '<td></td>' else "",
                     "Carry Exp.(Cr)": _fmt_num_for_grid(ec.get("carry_exp_cr")),
                     "Net Exp.(Cr)": _fmt_num_for_grid(ec.get("net_exp") / 1e7),
-                    "Traded Val(Cr)": _fmt_num_for_grid(ec.get("traded_val") / 1e7),
+                    "TV(Cr)": _fmt_num_for_grid(ec.get("traded_val") / 1e7),
                     "Cost": _fmt_num_for_grid(ec.get("cost"), 0),
                     "Cost%(Bips)": _fmt_num_for_grid(ec.get("cost_pct") * 100 if ec.get("traded_val") else None),
-                    "Carry PnL": _fmt_num_for_grid(ec.get("carry"), 0),
+                    "C PNL": _fmt_num_for_grid(ec.get("carry"), 0),
                     "Realized": _fmt_num_for_grid(ec.get("realized"), 0),
                     "Unrealized": _fmt_num_for_grid(ec.get("unrealized"), 0),
                     "Day PnL": _fmt_num_for_grid(ec.get("day"), 0),
@@ -1817,10 +1866,10 @@ def render_aggrid_position_table(data: list[dict], expand_all: bool, expanded_sy
         # from visible header + cell contents, so names stay readable without
         # wasting horizontal space.
         "Symbol / Expiry": 140, "Lot Size": 78, "Token": 74, "Real Sig": 76, "Final Sig": 82,
-        "LTP": 78, "Buy Avg": 82, "Sell Avg": 84, "Carry Lots": 86,
-        "Carry Avg": 86, "Lots": 62, "⚡": 42, "Carry Exp.(Cr)": 104,
-        "Net Exp.(Cr)": 96, "Traded Val(Cr)": 108, "Cost": 72,
-        "Cost%(Bips)": 94, "Carry PnL": 90, "Realized": 86,
+        "LTP": 78, "Buy Avg": 82, "Sell Avg": 84, "C Lot": 62,
+        "C Avg": 76, "Lots": 62, "⚡": 42, "Carry Exp.(Cr)": 104,
+        "Net Exp.(Cr)": 96, "TV(Cr)": 82, "Cost": 72,
+        "Cost%(Bips)": 94, "C PNL": 76, "Realized": 86,
         "Unrealized": 96, "Day PnL": 86, "Net PnL": 86, "PnL%": 66,
         "Slippage (bp)": 98, "INR Slip (bp)": 98, "Last Fill": 90,
     }
@@ -1836,9 +1885,9 @@ def render_aggrid_position_table(data: list[dict], expand_all: bool, expanded_sy
       if (params.value === null || params.value === undefined || params.value === '') return '—';
       let v = Number(params.value);
       if (isNaN(v)) return params.value;
-      const oneDec = ['Carry Lots','Lots'];
-      const twoDec = ['LTP','Buy Avg','Sell Avg','Carry Avg','Carry Exp.(Cr)','Net Exp.(Cr)','Traded Val(Cr)','Cost%(Bips)','PnL%','Slippage (bp)','INR Slip (bp)'];
-      const zeroDec = ['Cost','Carry PnL','Realized','Unrealized','Day PnL','Net PnL'];
+      const oneDec = ['C Lot','Lots'];
+      const twoDec = ['LTP','Buy Avg','Sell Avg','C Avg','Carry Exp.(Cr)','Net Exp.(Cr)','TV(Cr)','Cost%(Bips)','PnL%','Slippage (bp)','INR Slip (bp)'];
+      const zeroDec = ['Cost','C PNL','Realized','Unrealized','Day PnL','Net PnL'];
       let d = twoDec.includes(params.colDef.field) ? 2 : (oneDec.includes(params.colDef.field) ? 1 : 0);
       if (zeroDec.includes(params.colDef.field)) d = 0;
       return v.toLocaleString('en-IN', {minimumFractionDigits: d, maximumFractionDigits: d});
@@ -1861,7 +1910,7 @@ def render_aggrid_position_table(data: list[dict], expand_all: bool, expanded_sy
       const dark = {'backgroundColor':'#13151c','color':'#7a8294','fontFamily':'JetBrains Mono, monospace','fontSize':'11px'};
       const stock = {'backgroundColor':'#1a1d26','color':'#c0c6d4','fontWeight':'600','fontFamily':'JetBrains Mono, monospace','fontSize':'11px'};
       let s = params.data && params.data._row_type === 'stock' ? stock : dark;
-      const pnlCols = ['Carry PnL','Realized','Unrealized','Day PnL','Net PnL','PnL%','Slippage (bp)','INR Slip (bp)'];
+      const pnlCols = ['C PNL','Realized','Unrealized','Day PnL','Net PnL','PnL%','Slippage (bp)','INR Slip (bp)'];
       if (pnlCols.includes(params.colDef.field) && params.value !== null && params.value !== undefined && params.value !== '') {
         let v = Number(params.value);
         if (v > 0) s = {...s, color:'#00e0a4'};
@@ -2062,31 +2111,82 @@ def main():
             st.error(f"❌ {st.session_state.snap_msg}", icon=None)
 
     # ── KPI strip ────────────────────────────────────────────
-    k1, k2, k3, k4, k4b, k5, k6, k7, k8 = st.columns(9)
+    k1, k2, k3, k_tv_buy, k_tv_sell, k4, k4b, k4c, k5, k6, k7, k8 = st.columns(12)
     k1.metric("Net Exposure",   fmt_inr(kpis["net_exp"]))
     k2.metric("Gross Exposure", fmt_inr(kpis["gross_exp"]))
-    k3.metric("Carry PnL",      fmt_inr(kpis["carry_locked"] + kpis["carry"], show_sign=True))
+    k3.metric("C PNL",      fmt_inr(kpis["carry"], show_sign=True))
+
+    buy_tv_total = sum(
+        (e.get("qty_today_buy", 0) or 0) * (e.get("buy_avg", 0) or e.get("ltp", 0) or 0)
+        for stock in data for e in stock.get("expiries", [])
+    )
+    sell_tv_total = sum(
+        (e.get("qty_today_sell", 0) or 0) * (e.get("sell_avg", 0) or e.get("ltp", 0) or 0)
+        for stock in data for e in stock.get("expiries", [])
+    )
+    k_tv_buy.metric("Buy TV", fmt_inr(buy_tv_total))
+    k_tv_sell.metric("Sell TV", fmt_inr(sell_tv_total))
+
     k4.metric("Day PnL",        fmt_inr(kpis["day"],   show_sign=True))
     cur_net = kpis["net"]
-    # Persist Day High in Redis — only update when LIVE data (not DUMMY)
-    from datetime import date as _date
+
+    # Persist Day High / Day Low in Redis with timestamp.
+    from datetime import date as _date, datetime as _dt
+    import json as _json
     _today = _date.today().strftime("%Y%m%d")
+    _now_hm = _dt.now().strftime("%H:%M")
     _dh_key = f"dashboard:day_high:{_today}"
+    _dl_key = f"dashboard:day_low:{_today}"
     _is_live = st.session_state.get("data_source", "dummy") == "log_file"
+
+    def _read_extreme(_r, _key):
+        raw = _r.get(_key)
+        if not raw:
+            return None, ""
+        try:
+            obj = _json.loads(raw)
+            return float(obj.get("value", 0.0)), obj.get("time", "")
+        except Exception:
+            try:
+                return float(raw), ""
+            except Exception:
+                return None, ""
+
     try:
         import redis as _redis_dh
         _r = _redis_dh.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True, socket_timeout=2.0)
-        _stored = _r.get(_dh_key)
-        _dh = float(_stored) if _stored else 0.0
+        _dh, _dh_time = _read_extreme(_r, _dh_key)
+        _dl, _dl_time = _read_extreme(_r, _dl_key)
+
+        if _is_live and (_dh is None or cur_net > _dh):
+            _dh, _dh_time = cur_net, _now_hm
+            _r.set(_dh_key, _json.dumps({"value": _dh, "time": _dh_time}), ex=86400)
+
+        if _is_live and (_dl is None or cur_net < _dl):
+            _dl, _dl_time = cur_net, _now_hm
+            _r.set(_dl_key, _json.dumps({"value": _dl, "time": _dl_time}), ex=86400)
+
+        _dh = cur_net if _dh is None else _dh
+        _dl = cur_net if _dl is None else _dl
+
+    except Exception:
+        _dh = getattr(st.session_state, "day_high_pnl", cur_net)
+        _dl = getattr(st.session_state, "day_low_pnl", cur_net)
+        _dh_time = getattr(st.session_state, "day_high_time", _now_hm)
+        _dl_time = getattr(st.session_state, "day_low_time", _now_hm)
+
         if _is_live and cur_net > _dh:
-            _dh = cur_net
-            _r.set(_dh_key, str(_dh), ex=86400)
-    except Exception as _e:
-        _dh = getattr(st.session_state, "day_high_pnl", 0.0)
-        if _is_live and cur_net > _dh:
-            _dh = cur_net
+            _dh, _dh_time = cur_net, _now_hm
+        if _is_live and cur_net < _dl:
+            _dl, _dl_time = cur_net, _now_hm
+
     st.session_state.day_high_pnl = _dh
-    k4b.metric("Day High", fmt_inr(_dh, show_sign=True))
+    st.session_state.day_low_pnl = _dl
+    st.session_state.day_high_time = _dh_time
+    st.session_state.day_low_time = _dl_time
+
+    k4b.metric(f"Net High @ {_dh_time or '—'}", fmt_inr(_dh, show_sign=True))
+    k4c.metric(f"Net Low @ {_dl_time or '—'}", fmt_inr(_dl, show_sign=True))
     k5.metric("Expenses",       fmt_inr(-kpis["expenses"], show_sign=True))
     k6.metric("Net PnL",        fmt_inr(kpis["net"],   show_sign=True))
     slips = kpis.get("slippages", [])
@@ -2100,10 +2200,14 @@ def main():
     else:
         k7.metric("Wtd Slip (bp)", "—")
     avg_t1 = fetch_avg_t1_minutes()
-    if avg_t1 is not None:
-        k8.metric("Avg T1 (sec)", f"{avg_t1 * 60:.0f} sec")
+    if avg_t1 is not None and avg_t1 > 0:
+        avg_t1_ms = avg_t1 * 60 * 1000   # minutes → milliseconds
+        if avg_t1_ms < 1000:
+            k8.metric("Avg T1 (ms)", f"{avg_t1_ms:.1f} ms")
+        else:
+            k8.metric("Avg T1 (ms)", f"{avg_t1_ms/1000:.2f} s")
     else:
-        k8.metric("Avg T1 (sec)", "—")
+        k8.metric("Avg T1 (ms)", "—")
 
     st.html("<div style='margin:10px 0 6px'></div>")
 
