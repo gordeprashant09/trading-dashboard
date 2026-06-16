@@ -72,6 +72,40 @@ def load_snapshots(date_str: str) -> list[dict]:
         return []
 
 
+
+def load_day_high_low(date_str: str) -> dict:
+    """Load Position Book day high/low from same Redis keys used by main dashboard."""
+    out = {}
+    try:
+        import redis as _redis
+        r = _redis.Redis(host=REDIS_HOST, port=REDIS_PORT,
+                         db=DASH_DB, decode_responses=True, socket_timeout=2)
+
+        for name, key in [
+            ("high", f"dashboard:day_high:{date_str}"),
+            ("low",  f"dashboard:day_low:{date_str}"),
+        ]:
+            raw = r.get(key)
+            if not raw:
+                continue
+
+            try:
+                import json
+                val = json.loads(raw)
+                if isinstance(val, dict):
+                    out[name] = float(val.get("pnl", val.get("value", 0)))
+                    out[name + "_time"] = str(val.get("time", ""))
+                else:
+                    out[name] = float(val)
+            except Exception:
+                out[name] = float(raw)
+
+    except Exception:
+        pass
+
+    return out
+
+
 def get_available_dates() -> list[str]:
     """Get dates that have chart data in Redis."""
     try:
@@ -90,11 +124,66 @@ def get_available_dates() -> list[str]:
 # ══════════════════════════════════════════════════════════════════
 
 def build_dual_axis_chart(snaps: list[dict], y1_key: str, y1_label: str,
-                           y1_color: str = "#2eca8a") -> dict:
+                           y1_color: str = "#2eca8a", high_low: dict | None = None) -> dict:
     """Build Plotly dual-axis chart config."""
     times      = [s["time"] for s in snaps]
-    y1_vals    = [s.get(y1_key, 0) / 1e5 for s in snaps]  # convert to L
+    y1_vals    = [s.get(y1_key, 0) for s in snaps]  # in ₹
     nifty_vals = [s.get("nifty", 0) for s in snaps]
+
+    extra_traces = []
+    if y1_key == "net_pnl" and y1_vals:
+        high_low = high_low or {}
+
+        def nearest_x(target_time: str, fallback_idx: int) -> str:
+            if target_time and target_time in times:
+                return target_time
+            return times[fallback_idx]
+
+        hi_val = high_low.get("high")
+        lo_val = high_low.get("low")
+        hi_time = high_low.get("high_time", "")
+        lo_time = high_low.get("low_time", "")
+
+        if hi_val is None:
+            hi_idx = max(range(len(y1_vals)), key=lambda i: y1_vals[i])
+            hi_val = y1_vals[hi_idx]
+            hi_x = times[hi_idx]
+        else:
+            hi_idx = min(range(len(y1_vals)), key=lambda i: abs(y1_vals[i] - hi_val))
+            hi_x = nearest_x(hi_time, hi_idx)
+
+        if lo_val is None:
+            lo_idx = min(range(len(y1_vals)), key=lambda i: y1_vals[i])
+            lo_val = y1_vals[lo_idx]
+            lo_x = times[lo_idx]
+        else:
+            lo_idx = min(range(len(y1_vals)), key=lambda i: abs(y1_vals[i] - lo_val))
+            lo_x = nearest_x(lo_time, lo_idx)
+
+        extra_traces = [
+            {
+                "x": [hi_x],
+                "y": [hi_val],
+                "type": "scatter",
+                "mode": "markers+text",
+                "name": f"Day High {hi_val:,.0f}",
+                "marker": {"size": 10, "symbol": "triangle-up", "color": "#00d084"},
+                "text": [f"High {hi_val:,.0f}"],
+                "textposition": "top center",
+                "yaxis": "y1",
+            },
+            {
+                "x": [lo_x],
+                "y": [lo_val],
+                "type": "scatter",
+                "mode": "markers+text",
+                "name": f"Day Low {lo_val:,.0f}",
+                "marker": {"size": 10, "symbol": "triangle-down", "color": "#f05252"},
+                "text": [f"Low {lo_val:,.0f}"],
+                "textposition": "bottom center",
+                "yaxis": "y1",
+            },
+        ]
 
     return {
         "data": [
@@ -104,6 +193,7 @@ def build_dual_axis_chart(snaps: list[dict], y1_key: str, y1_label: str,
                 "name": y1_label,
                 "line": {"color": y1_color, "width": 2},
                 "yaxis": "y1",
+                "hovertemplate": "%{x}<br>%{y:,.0f}<extra></extra>",
             },
             {
                 "x": times, "y": nifty_vals,
@@ -111,7 +201,9 @@ def build_dual_axis_chart(snaps: list[dict], y1_key: str, y1_label: str,
                 "name": "NIFTY",
                 "line": {"color": "#e8a825", "width": 1.5, "dash": "dot"},
                 "yaxis": "y2",
+                "hovertemplate": "%{y:,.0f}<extra>NIFTY</extra>",
             },
+            *extra_traces,
         ],
         "layout": {
             "paper_bgcolor": "#0f1117",
@@ -133,7 +225,7 @@ def build_dual_axis_chart(snaps: list[dict], y1_key: str, y1_label: str,
             "yaxis2": {
                 "title": "NIFTY",
                 "overlaying": "y", "side": "right",
-                "gridcolor": "#1e2230", "tickfont": {"size": 10},
+                "exponentformat": "none", "tickformat": ",.0f", "gridcolor": "#1e2230", "tickfont": {"size": 10},
                 "title": {"font": {"color": "#e8a825"}},
                 "tickfont":  {"color": "#e8a825"},
                 "showgrid": False,
@@ -143,10 +235,235 @@ def build_dual_axis_chart(snaps: list[dict], y1_key: str, y1_label: str,
     }
 
 
+def build_normalized_chart(snaps: list[dict], y1_key: str, y1_label: str,
+                            y1_color: str = "#2eca8a") -> dict:
+    """
+    Normalized % change chart — both Net PnL and NIFTY rebased to 0% at the
+    first snapshot. This lets you directly compare direction & magnitude.
+
+    Net PnL % change  = (pnl_now - pnl_first) / abs(pnl_first) * 100
+    NIFTY % change    = (nifty_now - nifty_first) / nifty_first * 100
+
+    Interpretation:
+      Lines moving together  → PnL positively correlated with NIFTY
+      Lines diverging        → PnL is moving independently (alpha / hedge)
+      PnL rising, NIFTY flat → pure alpha
+    """
+    times      = [s["time"] for s in snaps]
+    y1_vals    = [s.get(y1_key, 0) for s in snaps]
+    nifty_vals = [s.get("nifty", 0) for s in snaps]
+
+    # Rebase from first non-zero value
+    pnl_base   = next((v for v in y1_vals    if v != 0), None)
+    nifty_base = next((v for v in nifty_vals if v != 0), None)
+
+    def pct(vals, base):
+        if base is None or base == 0:
+            return [0.0] * len(vals)
+        return [round((v - base) / abs(base) * 100, 3) for v in vals]
+
+    pnl_pct   = pct(y1_vals,    pnl_base)
+    nifty_pct = pct(nifty_vals, nifty_base)
+
+    # Correlation label for chart title
+    if len(pnl_pct) > 1:
+        import statistics
+        try:
+            n = len(pnl_pct)
+            mean_p = sum(pnl_pct)   / n
+            mean_n = sum(nifty_pct) / n
+            cov    = sum((p - mean_p) * (q - mean_n)
+                         for p, q in zip(pnl_pct, nifty_pct)) / n
+            std_p  = statistics.stdev(pnl_pct)   or 1e-9
+            std_n  = statistics.stdev(nifty_pct) or 1e-9
+            corr   = round(cov / (std_p * std_n), 2)
+            corr_label = f"  |  Correlation: {corr:+.2f}"
+        except Exception:
+            corr_label = ""
+    else:
+        corr_label = ""
+
+    return {
+        "data": [
+            {
+                "x": times, "y": pnl_pct,
+                "type": "scatter", "mode": "lines",
+                "name": f"{y1_label} % chg",
+                "line": {"color": y1_color, "width": 2},
+                "yaxis": "y1",
+                "hovertemplate": "%{x}<br>" + y1_label + ": %{y:+.2f}%<extra></extra>",
+            },
+            {
+                "x": times, "y": nifty_pct,
+                "type": "scatter", "mode": "lines",
+                "name": "NIFTY % chg",
+                "line": {"color": "#e8a825", "width": 1.5, "dash": "dot"},
+                "yaxis": "y1",
+                "hovertemplate": "%{x}<br>NIFTY: %{y:+.2f}%<extra></extra>",
+            },
+            # Zero baseline
+            {
+                "x": [times[0], times[-1]] if times else [],
+                "y": [0, 0],
+                "type": "scatter", "mode": "lines",
+                "name": "baseline",
+                "line": {"color": "rgba(255,255,255,0.1)", "width": 1, "dash": "dash"},
+                "yaxis": "y1",
+                "showlegend": False,
+                "hoverinfo": "skip",
+            },
+        ],
+        "layout": {
+            "paper_bgcolor": "#0f1117",
+            "plot_bgcolor":  "#13151a",
+            "font": {"color": "#7a8294", "family": "JetBrains Mono"},
+            "margin": {"t": 30, "b": 40, "l": 60, "r": 20},
+            "legend": {"x": 0, "y": 1, "bgcolor": "rgba(0,0,0,0)",
+                       "font": {"size": 11}},
+            "xaxis": {
+                "gridcolor": "#1e2230", "tickfont": {"size": 10},
+                "title": "Time (IST)",
+            },
+            "yaxis": {
+                "title": f"% Change from open{corr_label}",
+                "gridcolor": "#1e2230", "tickfont": {"size": 10},
+                "ticksuffix": "%",
+                "zeroline": False,
+            },
+            "hovermode": "x unified",
+        }
+    }
+
+
+
+def _first_nonzero(vals):
+    for v in vals:
+        try:
+            fv = float(v)
+            if fv != 0:
+                return fv
+        except Exception:
+            continue
+    return None
+
+
+def _pct_change(vals, base=None):
+    if base is None:
+        base = _first_nonzero(vals)
+    if base is None or base == 0:
+        return [0.0 for _ in vals]
+    out = []
+    for v in vals:
+        try:
+            out.append(round((float(v) - base) / abs(base) * 100, 3))
+        except Exception:
+            out.append(0.0)
+    return out
+
+
+def _corr_label(a, b):
+    try:
+        import statistics
+        if len(a) < 3 or len(b) < 3:
+            return ""
+        n = min(len(a), len(b))
+        a = a[:n]
+        b = b[:n]
+        ma = sum(a) / n
+        mb = sum(b) / n
+        cov = sum((x - ma) * (y - mb) for x, y in zip(a, b)) / n
+        sa = statistics.stdev(a) or 1e-9
+        sb = statistics.stdev(b) or 1e-9
+        return f" | Corr: {cov / (sa * sb):+.2f}"
+    except Exception:
+        return ""
+
+
+def _normalized_layout(title, corr_label=""):
+    return {
+        "paper_bgcolor": "#0f1117",
+        "plot_bgcolor":  "#13151a",
+        "font": {"color": "#7a8294", "family": "JetBrains Mono"},
+        "margin": {"t": 30, "b": 40, "l": 60, "r": 20},
+        "legend": {"x": 0, "y": 1, "bgcolor": "rgba(0,0,0,0)", "font": {"size": 11}},
+        "xaxis": {"gridcolor": "#1e2230", "tickfont": {"size": 10}, "title": "Time (IST)"},
+        "yaxis": {"title": f"{title}{corr_label}", "gridcolor": "#1e2230",
+                  "tickfont": {"size": 10}, "ticksuffix": "%", "zeroline": False},
+        "hovermode": "x unified",
+    }
+
+
+def build_normalized_symbol_chart(snaps: list[dict], symbol: str) -> dict:
+    """Symbol MTM and NIFTY normalized to % change from first non-zero snapshot."""
+    times = [s["time"] for s in snaps]
+    sym_vals = [s.get("symbols", {}).get(symbol, {}).get("net_pnl", 0) for s in snaps]
+    nifty_vals = [s.get("nifty", 0) for s in snaps]
+
+    sym_pct = _pct_change(sym_vals)
+    nifty_pct = _pct_change(nifty_vals)
+    corr = _corr_label(sym_pct, nifty_pct)
+
+    last_raw = sym_vals[-1] if sym_vals else 0
+    line_color = "#2eca8a" if last_raw >= 0 else "#f05252"
+
+    return {
+        "data": [
+            {"x": times, "y": sym_pct, "type": "scatter", "mode": "lines",
+             "name": f"{symbol} MTM % chg", "line": {"color": line_color, "width": 2},
+             "hovertemplate": "%{x}<br>" + symbol + ": %{y:+.2f}%<extra></extra>"},
+            {"x": times, "y": nifty_pct, "type": "scatter", "mode": "lines",
+             "name": "NIFTY % chg", "line": {"color": "#e8a825", "width": 1.5, "dash": "dot"},
+             "hovertemplate": "%{x}<br>NIFTY: %{y:+.2f}%<extra></extra>"},
+            {"x": [times[0], times[-1]] if times else [], "y": [0, 0],
+             "type": "scatter", "mode": "lines", "name": "baseline",
+             "line": {"color": "rgba(255,255,255,0.1)", "width": 1, "dash": "dash"},
+             "showlegend": False, "hoverinfo": "skip"},
+        ],
+        "layout": _normalized_layout("% Change from first snapshot", corr),
+    }
+
+
+def build_normalized_multi_symbol_chart(snaps: list[dict], symbols: list[str]) -> dict:
+    """Combined selected symbols normalized to % change, with NIFTY also normalized."""
+    times = [s["time"] for s in snaps]
+    nifty_vals = [s.get("nifty", 0) for s in snaps]
+    nifty_pct = _pct_change(nifty_vals)
+
+    colors = ["#2eca8a", "#4a9eff", "#f05252", "#e8a825",
+              "#a855f7", "#06b6d4", "#f97316", "#84cc16"]
+
+    traces = []
+    for idx, sym in enumerate(symbols):
+        vals = [s.get("symbols", {}).get(sym, {}).get("net_pnl", 0) for s in snaps]
+        pct = _pct_change(vals)
+        traces.append({
+            "x": times, "y": pct, "type": "scatter", "mode": "lines",
+            "name": f"{sym} % chg",
+            "line": {"color": colors[idx % len(colors)], "width": 1.7},
+            "hovertemplate": "%{x}<br>" + sym + ": %{y:+.2f}%<extra></extra>",
+        })
+
+    traces.append({
+        "x": times, "y": nifty_pct, "type": "scatter", "mode": "lines",
+        "name": "NIFTY % chg",
+        "line": {"color": "#e8a825", "width": 2, "dash": "dot"},
+        "hovertemplate": "%{x}<br>NIFTY: %{y:+.2f}%<extra></extra>",
+    })
+
+    if times:
+        traces.append({
+            "x": [times[0], times[-1]], "y": [0, 0],
+            "type": "scatter", "mode": "lines", "name": "baseline",
+            "line": {"color": "rgba(255,255,255,0.1)", "width": 1, "dash": "dash"},
+            "showlegend": False, "hoverinfo": "skip",
+        })
+
+    return {"data": traces, "layout": _normalized_layout("% Change from first snapshot")}
+
 def build_symbol_chart(snaps: list[dict], symbol: str) -> dict:
     """Build symbol-wise MTM vs NIFTY chart."""
     times      = [s["time"] for s in snaps]
-    sym_pnl    = [s.get("symbols", {}).get(symbol, {}).get("net_pnl", 0) / 1e5
+    sym_pnl    = [s.get("symbols", {}).get(symbol, {}).get("net_pnl", 0)
                   for s in snaps]
     nifty_vals = [s.get("nifty", 0) for s in snaps]
 
@@ -162,6 +479,7 @@ def build_symbol_chart(snaps: list[dict], symbol: str) -> dict:
                 "name": f"{symbol} MTM",
                 "line": {"color": line_color, "width": 2},
                 "yaxis": "y1",
+                "hovertemplate": "%{x}<br>%{y:,.0f}<extra></extra>",
                 "fill": "tozeroy",
                 "fillcolor": f"rgba({'46,202,138' if last_pnl >= 0 else '240,82,82'},0.1)",
             },
@@ -171,6 +489,7 @@ def build_symbol_chart(snaps: list[dict], symbol: str) -> dict:
                 "name": "NIFTY",
                 "line": {"color": "#e8a825", "width": 1.5, "dash": "dot"},
                 "yaxis": "y2",
+                "hovertemplate": "%{y:,.0f}<extra>NIFTY</extra>",
             },
         ],
         "layout": {
@@ -190,7 +509,7 @@ def build_symbol_chart(snaps: list[dict], symbol: str) -> dict:
             "yaxis2": {
                 "title": "NIFTY",
                 "overlaying": "y", "side": "right",
-                "gridcolor": "#1e2230",
+                "exponentformat": "none", "tickformat": ",.0f", "gridcolor": "#1e2230",
                 "title": {"font": {"color": "#e8a825"}},
                 "tickfont":  {"color": "#e8a825"},
                 "showgrid": False,
@@ -230,6 +549,7 @@ def main():
 
     # ── Load snapshots ────────────────────────────────────────────
     snaps = load_snapshots(sel_date)
+    day_high_low = load_day_high_low(sel_date)
 
     with col_info:
         st.html(
@@ -256,7 +576,7 @@ def main():
     # ── Latest snapshot KPIs ─────────────────────────────────────
     latest = snaps[-1]
     k1, k2, k3, k4, k5 = st.columns(5)
-    def fmt(v): return f"+{v/1e5:.2f} L" if v >= 0 else f"{v/1e5:.2f} L"
+    def fmt(v): return f"+₹{v:,.0f}" if v >= 0 else f"₹{v:,.0f}"
     k1.metric("Net PnL",    fmt(latest["net_pnl"]))
     k2.metric("Net Exp",    fmt(latest["net_exp"]))
     k3.metric("Carry PnL",  fmt(latest["carry_pnl"]))
@@ -270,17 +590,46 @@ def main():
 
     with tab1:
 
+        # ── Chart mode toggle ─────────────────────────────────────────
+        col_lbl, col_tog = st.columns([5, 1])
+        with col_lbl:
+            st.html("<div style='font-size:11px;color:#555c6e;text-transform:uppercase;"
+                    "letter-spacing:.1em;margin-bottom:4px'>MTM (Net PnL) vs NIFTY</div>")
+        with col_tog:
+            normalized = st.toggle(
+                "Normalize all charts %", value=False, key="norm_toggle",
+                help=(
+                    "OFF — Dual axis: Net PnL (₹) left, NIFTY (pts) right. "
+                    "Visual overlap but units differ.\n\n"
+                    "ON — Both rebased to % change from first snapshot. "
+                    "Directly comparable: same direction = correlated, "
+                    "diverging = PnL moving independently of NIFTY. "
+                    "Correlation shown in Y-axis label."
+                )
+            )
+
         # ── Chart 1: MTM vs NIFTY ─────────────────────────────────────
-        st.html("<div style='font-size:11px;color:#555c6e;text-transform:uppercase;"
-                "letter-spacing:.1em;margin-bottom:4px'>MTM (Net PnL) vs NIFTY</div>")
-        chart1 = build_dual_axis_chart(snaps, "net_pnl", "Net PnL", "#2eca8a")
-        st.plotly_chart(chart1, use_container_width=True, config={"displayModeBar": False})
+        if normalized:
+            st.html(
+                "<div style='font-size:10px;color:#4a9eff;margin:-4px 0 6px;'>"
+                "📐 Normalized: all chart lines rebased to 0% from first non-zero snapshot. "
+                "Correlation shown in Y-axis label. "
+                "<span style='color:#2eca8a'>Green close to orange = NIFTY-driven PnL.</span>"
+                "</div>"
+            )
+            chart1 = build_normalized_chart(snaps, "net_pnl", "Net PnL", "#2eca8a")
+        else:
+            chart1 = build_dual_axis_chart(snaps, "net_pnl", "Net PnL", "#2eca8a", day_high_low)
+        st.plotly_chart(chart1, width="stretch", config={"displayModeBar": False})
 
         # ── Chart 2: Net Exposure vs NIFTY ────────────────────────────
         st.html("<div style='font-size:11px;color:#555c6e;text-transform:uppercase;"
                 "letter-spacing:.1em;margin-bottom:4px'>Net Exposure vs NIFTY</div>")
-        chart2 = build_dual_axis_chart(snaps, "net_exp", "Net Exposure", "#4a9eff")
-        st.plotly_chart(chart2, use_container_width=True, config={"displayModeBar": False})
+        if normalized:
+            chart2 = build_normalized_chart(snaps, "net_exp", "Net Exposure", "#4a9eff")
+        else:
+            chart2 = build_dual_axis_chart(snaps, "net_exp", "Net Exposure", "#4a9eff")
+        st.plotly_chart(chart2, width="stretch", config={"displayModeBar": False})
 
         # ── Chart 3: Symbol-wise MTM vs NIFTY ────────────────────────
         st.html("<div style='font-size:11px;color:#555c6e;text-transform:uppercase;"
@@ -312,8 +661,8 @@ def main():
                             with cols[j]:
                                 st.html(f"<div style='font-size:11px;color:#7a8294;"
                                         f"font-weight:600;margin-bottom:2px'>{sym}</div>")
-                                chart = build_symbol_chart(snaps, sym)
-                                st.plotly_chart(chart, use_container_width=True,
+                                chart = build_normalized_symbol_chart(snaps, sym) if normalized else build_symbol_chart(snaps, sym)
+                                st.plotly_chart(chart, width="stretch",
                                                config={"displayModeBar": False})
                 else:
                     # Single combined chart
@@ -323,7 +672,7 @@ def main():
                     colors = ["#2eca8a","#4a9eff","#f05252","#e8a825",
                               "#a855f7","#06b6d4","#f97316","#84cc16"]
                     for idx, sym in enumerate(sel_syms):
-                        pnl = [s.get("symbols",{}).get(sym,{}).get("net_pnl",0)/1e5
+                        pnl = [s.get("symbols",{}).get(sym,{}).get("net_pnl",0)
                                for s in snaps]
                         traces.append({
                             "x": times, "y": pnl,
@@ -331,6 +680,7 @@ def main():
                             "name": sym,
                             "line": {"color": colors[idx % len(colors)], "width": 1.5},
                             "yaxis": "y1",
+                "hovertemplate": "%{x}<br>%{y:,.0f}<extra></extra>",
                         })
                     traces.append({
                         "x": times, "y": nifty,
@@ -338,8 +688,9 @@ def main():
                         "name": "NIFTY",
                         "line": {"color": "#e8a825", "width": 1.5, "dash": "dot"},
                         "yaxis": "y2",
+                "hovertemplate": "%{y:,.0f}<extra>NIFTY</extra>",
                     })
-                    combined = {
+                    combined = build_normalized_multi_symbol_chart(snaps, sel_syms) if normalized else {
                         "data": traces,
                         "layout": {
                             "paper_bgcolor": "#0f1117",
@@ -348,8 +699,10 @@ def main():
                             "margin": {"t": 30, "b": 40, "l": 60, "r": 60},
                             "legend": {"x": 0, "y": 1, "bgcolor": "rgba(0,0,0,0)"},
                             "xaxis": {"gridcolor": "#1e2230"},
-                            "yaxis": {"title": "MTM (L)", "gridcolor": "#1e2230"},
-                            "yaxis2": {
+                            "yaxis": {"title": "MTM (₹)", "tickformat": ",.0f", "exponentformat": "none", "tickformat": ",.0f",
+                "tickformat": ",.0f",
+                "tickprefix": "₹", "gridcolor": "#1e2230"},
+                            "yaxis2_SKIP": {
                                 "title": "NIFTY", "overlaying": "y", "side": "right",
                                 "showgrid": False,
                                 "title": {"font": {"color": "#e8a825"}},
@@ -358,7 +711,7 @@ def main():
                             "hovermode": "x unified",
                         }
                     }
-                    st.plotly_chart(combined, use_container_width=True,
+                    st.plotly_chart(combined, width="stretch",
                                    config={"displayModeBar": False})
 
 

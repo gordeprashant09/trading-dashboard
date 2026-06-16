@@ -303,4 +303,4 @@ def show_symbol_pnl_tab():
         col=2,
     )
 
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, width='stretch')

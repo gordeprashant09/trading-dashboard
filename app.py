@@ -6,7 +6,8 @@ Single Streamlit entry point that merges:
   2. 📈 Charts         (dashboard_charts.py)
   3. 📅 Daily PnL      (dropcopy_pnl_tab.py)
   4. 📉 Slippage       (slippage_dashboard_final.py)
-  5. 🏷️ Symbol PnL     (symbol_pnl_tab.py)   ← NEW
+  5. 🏷️ Symbol PnL     (symbol_pnl_tab.py)
+  6. 🧮 Stock Fut Margin (stock_future_margin_tab.py)   ← NEW
 
 Run:
     streamlit run app.py --server.port 8502
@@ -103,12 +104,13 @@ st.html("""
 # ─────────────────────────────────────────────────────────────────
 # FIVE TABS
 # ─────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊  Position Book",
     "📈  MTM vs NIFTY",
     "📅  Daily PnL (Dropcopy)",
     "📉  Slippage",
-    "🏷️  Symbol PnL",          # ← NEW
+    "🏷️  Symbol PnL",
+    "🧮  Stock Fut Margin",        # ← NEW
 ])
 
 
@@ -201,3 +203,13 @@ with tab5:
     except Exception as e:
         st.error(f"Symbol PnL tab failed to load: {e}")
         st.exception(e)
+
+# ── Tab 6 — NSE Stock Future Margin ───────────────────────────────
+with tab6:
+    try:
+        from stock_future_margin_tab import show_stock_future_margin_tab
+        show_stock_future_margin_tab()
+    except Exception as e:
+        st.error(f"Stock Future Margin tab failed to load: {e}")
+        st.exception(e)
+
