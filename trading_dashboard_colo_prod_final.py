@@ -547,19 +547,35 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
     # Case 2: overnight squareoff — excess sells close overnight long (or vice versa)
     # e.g. overnight=+2625, sell_today=2625 → fully squared off overnight position
     # FIX: also remove carry for the closed portion to avoid double counting
+    #
+    # FIX (2026-06-23): original logic only triggered when open_sel_qty > 0
+    # (i.e. sells exceed buys). But FIFO accounting means sells FIRST close
+    # the overnight long before opening new shorts — even when buy==sell today
+    # (e.g. INFY: overnight 400L, sold 400 at 09:30, rebought 400 at 09:35).
+    # In that case open_sel_qty=0 but the overnight was still fully closed.
+    # We must use qty_today_sell directly to determine overnight closure,
+    # not the residual open_sel_qty after intraday matching.
     qty_on = e["qty_overnight"]
-    if qty_on > 0 and open_sel_qty > 0:
-        close_qty    = min(qty_on, open_sel_qty)
+    if qty_on > 0 and e["qty_today_sell"] > 0:
+        close_qty    = min(qty_on, e["qty_today_sell"])
         realized    += close_qty * (e["sell_avg"] - e["prev_close"])
         carry       -= close_qty * (e["ltp"] - e["prev_close"])
-        remaining_sel = open_sel_qty - close_qty
-        unreal_sell   = remaining_sel * (e["sell_avg"] - e["ltp"]) if remaining_sel > 0 else 0
-    elif qty_on < 0 and open_buy_qty > 0:
-        close_qty    = min(abs(qty_on), open_buy_qty)
+        # Sells used to close overnight are no longer available to match
+        # against intraday buys — so those intraday buys become open/unrealized
+        freed_buys   = min(close_qty, matched_qty)   # buys freed up by reclassifying sells
+        unreal_buy  += freed_buys * (e["ltp"] - e["buy_avg"]) if freed_buys > 0 and e["buy_avg"] else 0
+        realized    -= freed_buys * (e["sell_avg"] - e["buy_avg"]) if freed_buys > 0 and e["buy_avg"] else 0
+        excess_sell  = max(0, open_sel_qty - close_qty)
+        unreal_sell  = excess_sell * (e["sell_avg"] - e["ltp"]) if excess_sell > 0 else 0
+    elif qty_on < 0 and e["qty_today_buy"] > 0:
+        close_qty    = min(abs(qty_on), e["qty_today_buy"])
         realized    += close_qty * (e["prev_close"] - e["buy_avg"])
         carry       += close_qty * (e["ltp"] - e["prev_close"])
-        remaining_buy = open_buy_qty - close_qty
-        unreal_buy    = remaining_buy * (e["ltp"] - e["buy_avg"]) if remaining_buy > 0 else 0
+        freed_sells  = min(close_qty, matched_qty)
+        unreal_sell += freed_sells * (e["sell_avg"] - e["ltp"]) if freed_sells > 0 and e["sell_avg"] else 0
+        realized    -= freed_sells * (e["sell_avg"] - e["buy_avg"]) if freed_sells > 0 and e["sell_avg"] else 0
+        excess_buy   = max(0, open_buy_qty - close_qty)
+        unreal_buy   = excess_buy * (e["ltp"] - e["buy_avg"]) if excess_buy > 0 else 0
 
     day         = realized + unreal_buy + unreal_sell
 
@@ -636,6 +652,7 @@ def calc_expiry_pnl(e: dict, lot_size: int) -> dict:
         "inr_slippage":       e.get("inr_slippage", None),
         "inr_slip_traded_val": e.get("inr_slip_traded_val", None),
         "eod_date":           e.get("eod_date", ""),
+        "fin_sig_lots":       e.get("fin_sig_lots", None),
     }
 
 
@@ -1734,6 +1751,7 @@ def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, ot
             "Last Fill": max([e.get("last_fill_time", "") for e in item["expiries"]] or [""]),
             "Real Sig": real_sig,
             "Final Sig": final_sig,
+            "Fin Sig Lots":  _fmt_num_for_grid(exp_calcs[0].get("fin_sig_lots") if exp_calcs else None, 0),
             "LTP": _fmt_num_for_grid(latest_ec.get("ltp")),
             "Buy Avg": _fmt_num_for_grid(latest_ec.get("buy_avg")),
             "Sell Avg": _fmt_num_for_grid(latest_ec.get("sell_avg")),
@@ -1767,6 +1785,7 @@ def build_aggrid_rows(data: list[dict], expand_all: bool, expanded_syms: set, ot
                     "Last Fill": e.get("last_fill_time", ""),
                     "Real Sig": real_sig,
                     "Final Sig": final_sig,
+                    "Fin Sig Lots":  _fmt_num_for_grid(ec.get("fin_sig_lots"), 0),
                     "LTP": _fmt_num_for_grid(ec.get("ltp")),
                     "Buy Avg": _fmt_num_for_grid(ec.get("buy_avg")),
                     "Sell Avg": _fmt_num_for_grid(ec.get("sell_avg")),
@@ -1872,6 +1891,7 @@ def render_aggrid_position_table(data: list[dict], expand_all: bool, expanded_sy
         "Cost%(Bips)": 94, "C PNL": 76, "Realized": 86,
         "Unrealized": 96, "Day PnL": 86, "Net PnL": 86, "PnL%": 66,
         "Slippage (bp)": 98, "INR Slip (bp)": 98, "Last Fill": 90,
+        "Fin Sig Lots": 96,
     }
     gb.configure_column("Symbol / Expiry", pinned="left", width=width_map["Symbol / Expiry"], minWidth=120, suppressSizeToFit=True, filter="agSetColumnFilter", filterParams=_set_filter_params.get("Symbol / Expiry", {}))
     if "Lot Size" in grid_df.columns:
@@ -1917,6 +1937,9 @@ def render_aggrid_position_table(data: list[dict], expand_all: bool, expanded_sy
         if (v < 0) s = {...s, color:'#ff4d57'};
       }
       if (params.colDef.field === '⚡' && params.value === '●') s = {...s, color:'#ff4444'};
+      if (params.colDef.field === 'Fin Sig Lots' && params.value !== null && params.value !== undefined && params.value !== '') {
+        s = {...s, color:'#e8a825', fontWeight:'600'};
+      }
       return s;
     }
     """)
@@ -2157,12 +2180,13 @@ def main():
         _r = _redis_dh.Redis(host=REDIS_HOST, port=REDIS_PORT, db=REDIS_DB, decode_responses=True, socket_timeout=2.0)
         _dh, _dh_time = _read_extreme(_r, _dh_key)
         _dl, _dl_time = _read_extreme(_r, _dl_key)
+        _sane = abs(cur_net) < 50000000
 
-        if _is_live and (_dh is None or cur_net > _dh):
+        if _is_live and _sane and (_dh is None or cur_net > _dh):
             _dh, _dh_time = cur_net, _now_hm
             _r.set(_dh_key, _json.dumps({"value": _dh, "time": _dh_time}), ex=86400)
 
-        if _is_live and (_dl is None or cur_net < _dl):
+        if _is_live and _sane and (_dl is None or cur_net < _dl):
             _dl, _dl_time = cur_net, _now_hm
             _r.set(_dl_key, _json.dumps({"value": _dl, "time": _dl_time}), ex=86400)
 

@@ -74,7 +74,7 @@ COLO_REDIS_DB   = int(os.getenv("COLO_REDIS_DB", "1"))
 # Snapshot saved once per day when IST time crosses EOD_SNAPSHOT_TIME.
 # Filename: dashboard_snapshot_<YYYYMMDD>.csv  (date comes from log filename)
 # Saved to REMOTE_DASHBOARD_DIR/snapshots/ on the colo server via SFTP.
-EOD_SNAPSHOT_TIME = os.getenv("EOD_SNAPSHOT_TIME", "15:32")   # HH:MM IST
+EOD_SNAPSHOT_TIME = os.getenv("EOD_SNAPSHOT_TIME", "15:35")   # HH:MM IST
 SNAPSHOT_SUBDIR   = os.getenv("SNAPSHOT_SUBDIR",   "snapshots")  # under REMOTE_DASHBOARD_DIR
 
 # stocks.csv — same file used by stock_realtime_feeder
@@ -85,6 +85,18 @@ STOCKS_CSV = os.getenv("STOCKS_CSV",
 LOOP_SECONDS   = float(os.getenv("DASH_LOOP_SECONDS", "5.0"))
 EXPENSE_PER_CR = float(os.getenv("EXPENSE_PER_CR",    "1906"))
 
+# ── Master Strategy Config (MSS) — Fin_Sig_Lots calculation ──────────────────
+# File on colo: /opt/obfeatures/config/exposure_cap_config.csv
+# INPUT capital in INR (140 Cr = 140 × 1e7)
+MSS_CONFIG_PATH = os.getenv("MSS_CONFIG_PATH",
+    "/opt/obfeatures/config/exposure_cap_config.csv")
+FIN_SIG_INPUT_CR = float(os.getenv("FIN_SIG_INPUT_CR", "10"))   # 10 Cr (override via env)
+
+# ── Signal Redis config (same as dashboard frontend) ─────────────────────────
+SIGNAL_REDIS_HOST = os.getenv("SIGNAL_REDIS_HOST", "127.0.0.1")
+SIGNAL_REDIS_PORT = int(os.getenv("SIGNAL_REDIS_PORT", "6379"))
+SIGNAL_REDIS_DB   = int(os.getenv("SIGNAL_REDIS_DB",   "0"))
+
 # Price divisor — NSE FO prices in log are in paise (divide by 100)
 PRICE_DIVISOR  = 100.0
 
@@ -93,6 +105,116 @@ SLIP_WINDOW_MINS  = 5     # fixed 5-minute grid windows (09:30, 09:35, 09:40 ...
 SLIP_CSV_DIR      = "/data/Dashboard/snapshots"
 SLIP_REDIS_PREFIX = "slippage:log"
 BOOK_DUMP_BASE    = "/data/live_feed_dump-sim2"   # {base}/{YYYYMMDD}/{token}.txt
+
+
+def load_mss_config() -> tuple[dict[str, int], int]:
+    """
+    Read master_strategy_config.csv from colo server via SSH.
+    Returns:
+      mss_map   : { "HDFCBANK": 11, "ICICIBANK": 12, ... }  — per-symbol MSS
+      total_mss : fixed denominator = sum of MSS across ALL rows in the file
+                  (including symbols with MSS=0), matching the Excel formula exactly.
+
+    File format:
+        stock,1026,10269,...   ← header row (skip)
+        HDFCBANK,0,0,1,0,2,...
+        ICICIBANK,0,0,1,0,2,...
+    """
+    mss_map: dict[str, int] = {}
+    total_mss: int = 0
+    try:
+        client = get_ssh_client()
+        _, stdout, _ = client.exec_command(f"cat {MSS_CONFIG_PATH} 2>/dev/null")
+        content = stdout.read().decode("utf-8", errors="replace")
+        client.close()
+
+        lines = content.strip().splitlines()
+        if not lines:
+            log.warning("MSS config file empty or not found: %s", MSS_CONFIG_PATH)
+            return mss_map, total_mss
+
+        for line in lines[1:]:   # skip header row (stock,1026,10269,...)
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split(",")
+            if len(parts) < 2:
+                continue
+            sym = parts[0].strip().upper()
+            if not sym or sym == "STOCK":
+                continue
+            sym = sym.replace("M.M", "M&M")
+            # MSS = sum of all non-zero numeric values in this row
+            row_sum = 0
+            for v in parts[1:-1]:
+                v = v.strip()
+                try:
+                    iv = int(v)
+                    if iv != 0:
+                        row_sum += iv
+                except ValueError:
+                    pass
+            mss_map[sym] = row_sum
+            total_mss += row_sum   # accumulate ALL rows including zero-MSS symbols
+
+        log.info("MSS config loaded: %d symbols, total_MSS=%d from %s",
+                 len(mss_map), total_mss, MSS_CONFIG_PATH)
+    except Exception as e:
+        log.warning("MSS config load failed: %s", e)
+    return mss_map, total_mss
+
+
+def compute_fin_sig_lots(
+    sym: str,
+    real_signal: float,
+    lot_size: int,
+    ltp: float,
+    mss_map: dict[str, int],
+    total_mss: int,
+) -> Optional[float]:
+    """
+    Compute Fin_Sig_Lots matching the Excel formula exactly:
+
+      MSS              = mss_map[sym]                      (row sum of non-zeros)
+      total_MSS        = sum of ALL rows in config file     (fixed denominator, incl. zero-MSS)
+      symbol_alloc     = (MSS / total_MSS) × INPUT_INR
+      Fin_Sig_INR      = (real_signal / MSS) × symbol_alloc
+                       = real_signal / total_MSS × INPUT_INR   (signed — negative = sell)
+      Fin_Sig_Lots     = Fin_Sig_INR / (LTP × lot_size)
+
+    Rounding:
+      0              → 0
+      0 < |x| < 1   → ±1   (never wipe a real signal to zero)
+      |x| >= 1       → standard round
+    """
+    try:
+        mss = mss_map.get(sym, 0)
+        if not mss or mss <= 0:
+            return None
+        if real_signal is None or lot_size <= 0 or not ltp or ltp <= 0:
+            return None
+        if total_mss <= 0:
+            return None
+        if real_signal == 0:
+            return 0
+
+        input_inr    = FIN_SIG_INPUT_CR * 1e7
+        symbol_alloc = (mss / total_mss) * input_inr
+        fin_sig_inr  = (real_signal / mss) * symbol_alloc   # signed
+        lot_value    = ltp * lot_size
+        raw_lots     = fin_sig_inr / lot_value
+
+        # Rounding: non-zero fraction → min ±1 lot; else standard round
+        if raw_lots == 0:
+            return 0
+        elif 0 < abs(raw_lots) < 1:
+            return 1 if raw_lots > 0 else -1
+        else:
+            return int(round(raw_lots))
+
+    except Exception as e:
+        log.debug("compute_fin_sig_lots failed for %s: %s", sym, e)
+        return None
 
 
 def floor_to_5min(dt: datetime) -> datetime:
@@ -1447,6 +1569,24 @@ def calc_pnl(
     open_buy    = qty_today_buy  - matched_qty   # net open long added today
     open_sell   = qty_today_sell - matched_qty   # net open short added today
 
+    # ── Carry square-off adjustment (FIFO) ────────────────────────────────
+    # When an overnight position is partially/fully closed intraday, that
+    # closed portion's PnL belongs in Realized, NOT in carry — otherwise
+    # carry keeps drifting with live LTP even after the position is gone.
+    #
+    # FIX (2026-06-23): INFY sold 400 overnight qty at 09:30 and rebought
+    # 400 at 09:35. Naive carry = 400*(ltp-prev_close) kept changing all
+    # morning. FIFO accounting: sells close the overnight LONG first before
+    # opening any new shorts; buys close overnight SHORTs first.
+    # So overnight_closed_by_sell = min(qty_overnight, qty_today_sell) = 400
+    # and carry for that closed portion = 0 (no open overnight exposure left).
+    if qty_overnight > 0 and qty_today_sell > 0:
+        overnight_closed = min(qty_overnight, qty_today_sell)
+        carry -= overnight_closed * (ltp - prev_close)
+    elif qty_overnight < 0 and qty_today_buy > 0:
+        overnight_closed = min(abs(qty_overnight), qty_today_buy)
+        carry += overnight_closed * (ltp - prev_close)
+
     # Realized PnL: locked at trade prices, LTP has NO effect
     realized    = matched_qty * (sell_avg - buy_avg) if matched_qty > 0 else 0.0
 
@@ -1557,7 +1697,10 @@ def load_locked_carry_from_snapshot(dt: str) -> dict[str, float]:
 def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict,
                    slip_engine=None, close_map: dict = None,
                    locked_carry_map: dict = None,
-                   eod_date: str = "") -> list[dict]:
+                   eod_date: str = "",
+                   mss_map: dict = None,
+                   total_mss: int = 0,
+                   signal_map: dict = None) -> list[dict]:
     """
     Returns dashboard DATA format:
     [
@@ -1570,11 +1713,18 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict,
     locked_carry_map : { expiry_label(str): carry_pnl(float) } — carry locked at
                        previous day's close; from yesterday's snapshot CSV
     eod_date         : YYYYMMDD string of the EOD date these overnight positions came from
+    mss_map          : { sym: MSS_total } from master_strategy_config.csv
+    total_mss        : fixed denominator = sum of ALL rows in config (incl. zero-MSS)
+    signal_map       : { sym: {"real_signal": float, ...} } from Redis
     """
     if close_map is None:
         close_map = {}
     if locked_carry_map is None:
         locked_carry_map = {}
+    if mss_map is None:
+        mss_map = {}
+    if signal_map is None:
+        signal_map = {}
     stock_map: dict[str, dict] = {}
 
     for key, p in positions.items():
@@ -1647,6 +1797,17 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict,
             locked_carry_map.get(_tsym, None)                    # 2. snapshot fallback
         )
 
+        # ── Fin_Sig_Lots ─────────────────────────────────────────
+        # real_signal comes from Redis signal_map (numeric value like 5, -3, etc.)
+        _lookup_sym = sym.upper().replace("M.M", "M&M")
+        _sig_data   = signal_map.get(_lookup_sym, {})
+        _real_sig_raw = _sig_data.get("real_signal", None)
+        try:
+            _real_sig = float(_real_sig_raw) if _real_sig_raw not in (None, "—", "", "None") else None
+        except (ValueError, TypeError):
+            _real_sig = None
+        fin_sig_lots = compute_fin_sig_lots(sym, _real_sig, lot_size, ltp, mss_map, total_mss)
+
         stock_map[sym]["expiries"].append({
             "label":            _tsym,
             "token":            token,
@@ -1671,6 +1832,8 @@ def group_by_stock(positions: dict, ltp_map: dict, eod_map: dict,
             # eod_date         : YYYYMMDD of the EOD that sourced qty_overnight.
             "carry_pnl_locked": carry_pnl_locked,
             "eod_date":         eod_date,
+            # Fin_Sig_Lots : final signal in lots based on MSS capital allocation
+            "fin_sig_lots":     fin_sig_lots,
         })
 
     return list(stock_map.values())
@@ -1989,8 +2152,32 @@ def main():
                     close_map        = get_close_map(r_ltp, positions, r_idx)
                     _eod_date        = prev_trading_date()
                     _locked_carry    = load_locked_carry_from_snapshot(_eod_date)
+                    try:
+                        _mss_map_eod, _total_mss_eod = load_mss_config()
+                    except Exception:
+                        _mss_map_eod, _total_mss_eod = {}, 0
+                    try:
+                        import redis as _redis_sig2
+                        _r_sig2 = _redis_sig2.Redis(
+                            host=SIGNAL_REDIS_HOST, port=SIGNAL_REDIS_PORT,
+                            db=SIGNAL_REDIS_DB, decode_responses=True, socket_timeout=2.0
+                        )
+                        _sig_keys2 = _r_sig2.keys("obstrategy:signal:latest:*")
+                        _signal_map_eod: dict[str, dict] = {}
+                        for _sk2 in _sig_keys2:
+                            _ssym2 = _sk2.replace("obstrategy:signal:latest:", "").upper()
+                            _vals2 = _r_sig2.hmget(_sk2, "real_signal", "final_signal")
+                            _signal_map_eod[_ssym2] = {
+                                "real_signal":  _vals2[0] or "—",
+                                "final_signal": _vals2[1] or "—",
+                            }
+                    except Exception:
+                        _signal_map_eod = {}
                     data             = group_by_stock(positions, ltp_map, eod_map, None,
-                                                      close_map, _locked_carry, _eod_date)
+                                                      close_map, _locked_carry, _eod_date,
+                                                      mss_map=_mss_map_eod,
+                                                      total_mss=_total_mss_eod,
+                                                      signal_map=_signal_map_eod)
                     log.info("EOD-only positions: %d stocks", len(data))
                 else:
                     data = []
@@ -2089,8 +2276,38 @@ def main():
             close_map     = get_close_map(r_ltp, positions, r_idx)
             _eod_date     = prev_trading_date()
             _locked_carry = load_locked_carry_from_snapshot(_eod_date)
+
+            # Load MSS config (Fin_Sig_Lots) — read once per cycle from colo SSH
+            try:
+                _mss_map, _total_mss = load_mss_config()
+            except Exception as _mss_err:
+                log.warning("MSS config load error: %s", _mss_err)
+                _mss_map, _total_mss = {}, 0
+
+            # Fetch real_signal from Redis for Fin_Sig_Lots computation
+            try:
+                import redis as _redis_sig
+                _r_sig = _redis_sig.Redis(
+                    host=SIGNAL_REDIS_HOST, port=SIGNAL_REDIS_PORT,
+                    db=SIGNAL_REDIS_DB, decode_responses=True, socket_timeout=2.0
+                )
+                _sig_keys = _r_sig.keys("obstrategy:signal:latest:*")
+                _signal_map: dict[str, dict] = {}
+                for _sk in _sig_keys:
+                    _ssym = _sk.replace("obstrategy:signal:latest:", "").upper()
+                    _vals = _r_sig.hmget(_sk, "real_signal", "final_signal")
+                    _signal_map[_ssym] = {
+                        "real_signal":  _vals[0] or "—",
+                        "final_signal": _vals[1] or "—",
+                    }
+            except Exception as _sig_err:
+                log.warning("Signal map fetch for MSS failed: %s", _sig_err)
+                _signal_map = {}
+
             data = group_by_stock(positions, ltp_map, eod_map, slip_eng, close_map,
-                                  _locked_carry, _eod_date)
+                                  _locked_carry, _eod_date,
+                                  mss_map=_mss_map, total_mss=_total_mss,
+                                  signal_map=_signal_map)
             log.info("Stocks grouped: %d underlyings", len(data))
             # Inject OTR into each expiry before publishing
             try:
